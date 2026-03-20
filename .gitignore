@@ -1,0 +1,27 @@
+# Rust build output
+/target/
+
+# Runtime log files produced by the monitor
+*.jsonl
+
+# Local runtime config (contains machine-specific paths)
+# Commit monitor.config.json.example instead if you want to share a template
+monitor.config.json
+
+# Windows artifacts
+*.pdb
+*.exp
+*.lib
+Thumbs.db
+
+# VS Code user settings (tasks.json at root is already tracked)
+.vscode/settings.json
+.vscode/launch.json
+.vscode/*.code-workspace
+
+# JetBrains / RustRover
+.idea/
+
+# Environment / secrets
+.env
+*.env.local

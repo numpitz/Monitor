@@ -1,0 +1,41 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "cargo build (debug)",
+      "type": "shell",
+      "command": "cargo",
+      "args": ["build"],
+      "group": "build",
+      "problemMatcher": ["$rustc"],
+      "presentation": {
+        "panel": "shared",
+        "reveal": "silent"   // only show the terminal if there are errors
+      }
+    },
+    {
+      "label": "cargo build (release)",
+      "type": "shell",
+      "command": "cargo",
+      "args": ["build", "--release"],
+      "group": "build",
+      "problemMatcher": ["$rustc"],
+      "presentation": {
+        "panel": "shared",
+        "reveal": "silent"
+      }
+    },
+    {
+      "label": "cargo check",
+      "type": "shell",
+      "command": "cargo",
+      "args": ["check"],
+      "group": "build",
+      "problemMatcher": ["$rustc"],
+      "presentation": {
+        "panel": "shared",
+        "reveal": "always"
+      }
+    }
+  ]
+}
