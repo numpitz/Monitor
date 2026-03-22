@@ -9,7 +9,7 @@ All three binaries share one `monitor.config.json` and write their own NDJSON lo
 |--------|---------|----------|
 | `process-monitor.exe` | Per-process CPU, RAM, handles, spawn/exit events | `proc_resources.jsonl` |
 | `system-monitor.exe` | System-wide free CPU, RAM, swap, disk, network, GPU | `sys_resources.jsonl` |
-| `monitor-ui.exe` | egui desktop app — edit configuration live | — |
+| `monitor-ui.exe` | egui desktop app — live config editor and process viewer | — |
 
 ---
 
@@ -60,6 +60,46 @@ monitor-ui.exe C:\monitor\
 
 The UI writes changes atomically.  Both monitors pick them up within ~400 ms
 via their built-in config-watcher — **no restart required**.
+
+---
+
+## monitor-ui
+
+The UI has two panels.
+
+### Configuration panel
+
+Edit both monitors without restarting them.
+
+| Control | Range | Effect when saved |
+|---------|-------|-------------------|
+| Process Monitor — enabled | checkbox | Monitor starts / skips on next launch |
+| Resource poll interval | 0 – 60 s | Per-process CPU / RAM sample rate (`0` = off) |
+| Snapshot interval | 0 – 600 s | Full process-tree snapshot rate (`0` = off) |
+| System Monitor — enabled | checkbox | Monitor starts / skips on next launch |
+| Poll interval | 0 – 300 s | System-wide sample rate (`0` = off) |
+
+Setting an interval to **0** pauses that sampling block immediately — the monitor
+process keeps running and responds to future config changes without a restart.
+
+### Process viewer panel
+
+Reads the latest `proc_resources.N.jsonl` log file and shows the current state
+of all watched processes.  Refreshes automatically every **5 seconds**; a manual
+**⟳ Refresh** button is available in the panel header.
+
+| Column | Description |
+|--------|-------------|
+| Name | Process executable name |
+| PID | OS process ID |
+| CPU % | CPU usage from the last `resource_sample` |
+| Mem MB | Resident memory from the last `resource_sample` |
+| Handles | Open handle count |
+| Threads | Thread count |
+| Last seen | `HH:MM:SS` of the last sample (or spawn / exit time) |
+
+Alive processes are shown in white.  Processes that have exited appear dimmed in
+grey with `—` for metrics and the exit time in **Last seen**.
 
 ---
 
