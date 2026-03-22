@@ -11,7 +11,7 @@ path = "src/lib.rs"
 
 [[bin]]
 name = "process-monitor"
-path = "src/main.rs"
+path = "src/bin/process_monitor.rs"
 
 [[bin]]
 name = "system-monitor"

@@ -21,7 +21,9 @@
 //! The main loop exits cleanly, drops the event channel, and the writer
 //! thread writes the `monitor_stop` entry before joining.
 
+#[path = "../discovery.rs"]
 mod discovery;
+#[path = "../sampler.rs"]
 mod sampler;
 
 use anyhow::Result;
