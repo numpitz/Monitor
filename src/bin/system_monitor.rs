@@ -160,8 +160,6 @@ fn main() -> Result<()> {
             .expect("failed to install Ctrl-C handler");
     }
 
-    let poll_interval = Duration::from_millis(sm.poll_interval_ms);
-
     // ── Initialise sysinfo ────────────────────────────────────────────────────
     // First refresh_cpu_usage() call establishes the measurement baseline.
     // CPU % on the next call will cover the poll_interval sleep as its window.
@@ -176,9 +174,12 @@ fn main() -> Result<()> {
     while running.load(Ordering::SeqCst) {
         let tick = Instant::now();
 
-        // Read current config (may have changed via hot-reload)
-        let log_cfg     = config.read().monitors.system_monitor.log.clone();
-        let watch_disks = config.read().monitors.system_monitor.watch_disks.clone();
+        // Read current config once per iteration — picks up any hot-reload changes,
+        // including interval changes written by a future UI application.
+        let sm_cfg      = config.read().monitors.system_monitor.clone();
+        let log_cfg     = sm_cfg.log.clone();
+        let watch_disks = sm_cfg.watch_disks.clone();
+        let poll_interval = Duration::from_millis(sm_cfg.poll_interval_ms);
 
         // ── CPU ───────────────────────────────────────────────────────────────
         // refresh_cpu_usage uses the elapsed time since the previous call as

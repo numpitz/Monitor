@@ -163,10 +163,8 @@ fn main() -> Result<()> {
     let mut discovery = ProcessDiscovery::new(&pm.watch_folders)?;
     let mut sampler   = ResourceSampler::new();
 
-    let poll_interval     = Duration::from_millis(pm.resource_poll_interval_ms);
-    let snapshot_interval = Duration::from_millis(pm.snapshot_interval_ms);
     let mut last_snapshot = Instant::now()
-        .checked_sub(snapshot_interval)        // trigger snapshot on first poll
+        .checked_sub(Duration::from_millis(pm.snapshot_interval_ms)) // trigger snapshot on first poll
         .unwrap_or_else(Instant::now);
 
     cprint!(args.no_console, "[process-monitor] watching {} folder(s):", pm.watch_folders.len());
@@ -178,8 +176,12 @@ fn main() -> Result<()> {
     while running.load(Ordering::SeqCst) {
         let tick = Instant::now();
 
-        // Read current logging config (may have changed via hot-reload)
-        let log_cfg = config.read().monitors.process_monitor.log.clone();
+        // Read current config once per iteration — picks up any hot-reload changes,
+        // including interval changes written by a future UI application.
+        let pm_cfg            = config.read().monitors.process_monitor.clone();
+        let log_cfg           = pm_cfg.log.clone();
+        let poll_interval     = Duration::from_millis(pm_cfg.resource_poll_interval_ms);
+        let snapshot_interval = Duration::from_millis(pm_cfg.snapshot_interval_ms);
 
         // ── 1. Discover spawns / exits ────────────────────────────────────────
         match discovery.poll() {
