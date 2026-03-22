@@ -63,9 +63,9 @@ impl MonitorApp {
                     proc_enabled: cfg.monitors.process_monitor.enabled,
                     sys_enabled:  cfg.monitors.system_monitor.enabled,
                     config: Ok(cfg),
-                    proc_poll_secs:     proc_poll_secs.max(1),
-                    proc_snapshot_secs: proc_snapshot_secs.max(1),
-                    sys_poll_secs:      sys_poll_secs.max(1),
+                    proc_poll_secs,
+                    proc_snapshot_secs,
+                    sys_poll_secs,
                     dirty:  false,
                     status: String::new(),
                 }
@@ -163,7 +163,7 @@ impl eframe::App for MonitorApp {
                         ui.label("Resource poll interval");
                         let before = self.proc_poll_secs;
                         ui.add(
-                            egui::Slider::new(&mut self.proc_poll_secs, 1..=60)
+                            egui::Slider::new(&mut self.proc_poll_secs, 0..=60)
                                 .suffix(" s")
                                 .clamping(egui::SliderClamping::Always),
                         );
@@ -174,7 +174,7 @@ impl eframe::App for MonitorApp {
                         ui.label("Snapshot interval");
                         let before = self.proc_snapshot_secs;
                         ui.add(
-                            egui::Slider::new(&mut self.proc_snapshot_secs, 10..=600)
+                            egui::Slider::new(&mut self.proc_snapshot_secs, 0..=600)
                                 .suffix(" s")
                                 .clamping(egui::SliderClamping::Always),
                         );
@@ -210,7 +210,7 @@ impl eframe::App for MonitorApp {
                         ui.label("Poll interval");
                         let before = self.sys_poll_secs;
                         ui.add(
-                            egui::Slider::new(&mut self.sys_poll_secs, 5..=300)
+                            egui::Slider::new(&mut self.sys_poll_secs, 0..=300)
                                 .suffix(" s")
                                 .clamping(egui::SliderClamping::Always),
                         );
@@ -248,10 +248,11 @@ impl eframe::App for MonitorApp {
 /// Human-readable hint shown next to the slider value.
 fn interval_hint(secs: u32) -> &'static str {
     match secs {
-        0..=4   => "very frequent",
-        5..=14  => "frequent",
-        15..=44 => "normal",
+        0        => "off",
+        1..=4    => "very frequent",
+        5..=14   => "frequent",
+        15..=44  => "normal",
         45..=119 => "relaxed",
-        _       => "infrequent",
+        _        => "infrequent",
     }
 }
