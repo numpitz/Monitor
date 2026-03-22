@@ -1,30 +1,37 @@
-# Monitor suite
+# Monitor Suite
 
-Rust 2024 · Windows 10+ · two standalone `.exe` files
+Rust 2024 · Windows 10+ · three standalone `.exe` files
 
-Two companion monitors that share one `monitor.config.json` and write their
-own NDJSON log files independently.  Run them side-by-side to get a complete
-picture of whether a video server (go2rtc) has enough resources to operate:
+A lightweight monitoring suite for video-streaming servers running **go2rtc** and **ffmpeg**.
+All three binaries share one `monitor.config.json` and write their own NDJSON log files.
 
-| Binary | What it watches | Log file |
-|--------|-----------------|----------|
-| `process-monitor.exe` | Specific processes: spawn/exit events, per-process CPU & RAM | `proc_resources.jsonl` |
-| `system-monitor.exe`  | System-wide headroom: free CPU, available RAM, free disk space | `sys_resources.jsonl` |
+| Binary | Purpose | Log file |
+|--------|---------|----------|
+| `process-monitor.exe` | Per-process CPU, RAM, handles, spawn/exit events | `proc_resources.jsonl` |
+| `system-monitor.exe` | System-wide free CPU, RAM, swap, disk, network, GPU | `sys_resources.jsonl` |
+| `monitor-ui.exe` | egui desktop app — edit configuration live | — |
 
 ---
 
 ## Build
 
-```
-# Both binaries in one command
-cargo build --release --target x86_64-pc-windows-msvc
+```powershell
+# Debug (fast compile, for development)
+cargo build
+
+# Release (optimised, stripped — for production)
+cargo build --release
+
+# Release with NVIDIA GPU monitoring (requires NVIDIA driver)
+cargo build --release --features nvidia
 ```
 
-Outputs:
+Outputs in `target\release\` (or `target\debug\`):
 
 ```
-target\release\process-monitor.exe
-target\release\system-monitor.exe
+process-monitor.exe
+system-monitor.exe
+monitor-ui.exe
 ```
 
 No runtime dependencies — each ships as a single file.
@@ -33,34 +40,36 @@ No runtime dependencies — each ships as a single file.
 
 ## Usage
 
-Both binaries accept the same arguments:
+All binaries take the same first argument: the directory that contains
+`monitor.config.json`.  Log files are also written there.
 
-```
-# With a console window (default)
+```powershell
+# Monitors — with console window
 process-monitor.exe C:\monitor\
 system-monitor.exe  C:\monitor\
 
-# Detach from console — no window (background / supervisor mode)
+# Monitors — detached, no window (background / supervisor mode)
 process-monitor.exe C:\monitor\ --no-console
 system-monitor.exe  C:\monitor\ --no-console
+
+# Configuration UI
+monitor-ui.exe C:\monitor\
 ```
 
-`C:\monitor\` must contain `monitor.config.json`.
-All log files are written into the same directory.
+### Live configuration
+
+The UI writes changes atomically.  Both monitors pick them up within ~400 ms
+via their built-in config-watcher — **no restart required**.
 
 ---
 
 ## Config (`monitor.config.json`)
 
-Both monitors read the same file.  Each has its own section under `monitors`
-so their intervals and thresholds are configured independently.
+All three binaries read the same file.
 
 ```json
 {
-  "log_rotation": {
-    "max_file_size_mb": 10,
-    "keep_files": 5
-  },
+  "log_rotation": { ... },
   "monitors": {
     "process_monitor": { ... },
     "system_monitor":  { ... }
@@ -68,56 +77,83 @@ so their intervals and thresholds are configured independently.
 }
 ```
 
-Config changes are picked up automatically by both running monitors — no
-restart needed.
-
-### Shared: `log_rotation`
+### `log_rotation`
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `max_file_size_mb` | 10 | Rotate the active log file when it exceeds this size |
-| `keep_files` | 5 | Number of rotated files to keep (oldest are deleted) |
+| `max_file_size_mb` | 10 | Rotate when the active log file exceeds this size |
+| `keep_files` | 5 | Number of rotated files to keep |
+
+---
 
 ### `monitors.process_monitor`
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `enabled` | `true` | Set to `false` to skip this monitor on startup |
-| `log_file` | `proc_resources.jsonl` | Base name for log files in the log dir |
-| `resource_poll_interval_ms` | 5000 | How often to sample per-process CPU/RAM |
-| `snapshot_interval_ms` | 60000 | How often to write a full process-tree snapshot |
-| `watch_folders` | required | Absolute paths — every `.exe` found here is watched |
-| `log.cpu_alert_threshold_percent` | null | Emit `cpu_alert` when a process exceeds this % |
-| `log.memory_alert_mb` | null | Emit `memory_alert` when a process exceeds this MB |
+| `enabled` | `true` | Set `false` to skip on startup |
+| `log_file` | `proc_resources.jsonl` | Base name for log files |
+| `resource_poll_interval_ms` | 5000 | Per-process CPU / RAM sample frequency |
+| `snapshot_interval_ms` | 60000 | Full process-tree snapshot frequency |
+| `watch_folders` | required | Absolute paths — every `.exe` here is watched |
+| `log.cpu_alert_threshold_percent` | null | WARN when a process exceeds this CPU % |
+| `log.memory_alert_mb` | null | WARN when a process exceeds this RAM (MB) |
+
+---
 
 ### `monitors.system_monitor`
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `enabled` | `true` | Set to `false` to skip this monitor on startup |
-| `log_file` | `sys_resources.jsonl` | Base name for log files in the log dir |
-| `poll_interval_ms` | 30000 | How often to sample system resources (30 s recommended) |
-| `watch_disks` | `[]` (all) | Mount points to report, e.g. `["C:\\"]`. Empty = all disks |
-| `log.cpu_alert_free_percent` | null | Emit `cpu_headroom_alert` when free CPU drops below this % |
-| `log.memory_alert_free_mb` | null | Emit `memory_headroom_alert` when available RAM drops below this MB |
-| `log.disk_alert_free_gb` | null | Emit `disk_headroom_alert` when free space drops below this GB |
+| `enabled` | `true` | Set `false` to skip on startup |
+| `log_file` | `sys_resources.jsonl` | Base name for log files |
+| `poll_interval_ms` | 30000 | How often to sample (30 s recommended) |
+| `watch_disks` | `[]` (all) | Mount points to report, e.g. `["C:\\"]` |
+| `watch_network_interfaces` | `[]` (all) | Interface names to report, e.g. `["Ethernet"]` |
+
+#### Thresholds — two levels per metric
+
+Every metric has a **WARN** threshold (approaching a limit) and an **ERROR/alert**
+threshold (limit breached).  Both are optional — omit either to disable that level.
+
+| Key | Default | Fires when… |
+|-----|---------|-------------|
+| `log.cpu_warn_free_percent` | 30 | CPU headroom < 30 % |
+| `log.cpu_alert_free_percent` | 10 | CPU headroom < 10 % |
+| `log.cpu_core_warn_percent` | 85 | Any single core > 85 % |
+| `log.cpu_core_alert_percent` | 95 | Any single core > 95 % |
+| `log.memory_warn_free_mb` | 1000 | Available RAM < 1000 MB |
+| `log.memory_alert_free_mb` | 500 | Available RAM < 500 MB |
+| `log.swap_warn_used_percent` | 30 | Swap used > 30 % |
+| `log.swap_alert_used_percent` | 70 | Swap used > 70 % |
+| `log.disk_warn_free_gb` | 20 | Any watched disk free < 20 GB |
+| `log.disk_alert_free_gb` | 10 | Any watched disk free < 10 GB |
+| `log.network_rx_warn_mbps` | null | Any interface RX > threshold MB/s |
+| `log.network_tx_warn_mbps` | null | Any interface TX > threshold MB/s |
+| `log.network_error_alert` | `true` | Any interface has RX or TX errors |
+| `log.gpu_warn_util_percent` | 80 | GPU utilisation > 80 % |
+| `log.gpu_alert_util_percent` | 95 | GPU utilisation > 95 % |
+| `log.gpu_encoder_warn_percent` | 80 | NVENC encoder > 80 % |
+| `log.gpu_vram_warn_free_mb` | 500 | VRAM free < 500 MB |
+| `log.gpu_vram_alert_free_mb` | 200 | VRAM free < 200 MB |
+| `log.gpu_temp_warn_c` | 80 | GPU temperature > 80 °C |
+| `log.gpu_temp_alert_c` | 90 | GPU temperature > 90 °C |
 
 ---
 
 ## Log file naming
 
-Each monitor uses the same numbered-rotation scheme:
+Each monitor uses numbered rotation independently:
 
 ```
 proc_resources.0.jsonl   ← oldest
 proc_resources.1.jsonl
-proc_resources.2.jsonl   ← active (highest number = current)
+proc_resources.2.jsonl   ← active
 
 sys_resources.0.jsonl
 sys_resources.1.jsonl    ← active
 ```
 
-Each file starts with a `monitor_start` entry.  Rotation entries include
+Every file starts with a `monitor_start` entry.  Rotation entries include
 `"continued_from"` so readers can follow the chain backwards.
 
 ---
@@ -128,33 +164,29 @@ All events share the same envelope:
 
 ```json
 {
-  "ts":      "<ISO-8601 UTC>",
+  "ts":      "2026-03-23T10:00:00.000Z",
   "monitor": "process_monitor | system_monitor",
   "event":   "<event_name>",
   "level":   "INFO | WARN | ERROR",
-  ... event-specific fields ...
+  "...":     "event-specific fields"
 }
 ```
+
+---
 
 ### Shared events (both monitors)
 
 #### `monitor_start`
-Written on startup and after every log rotation.
-
 ```json
 { "pid": 4821, "log_file": "proc_resources.2.jsonl", "rotation": false }
 ```
 
 #### `monitor_stop`
-Written on clean shutdown before process exit.
-
 ```json
 { "pid": 4821, "reason": "shutdown", "exit_code": 0 }
 ```
 
 #### `config_reloaded`
-Config file was changed and successfully reloaded.
-
 ```json
 { "path": "C:\\monitor\\monitor.config.json" }
 ```
@@ -164,56 +196,41 @@ Config file was changed and successfully reloaded.
 ### process-monitor events
 
 #### `process_spawned`
-A new `.exe` appeared inside a watch folder.
-
 ```json
 { "pid": 1235, "name": "ffmpeg.exe", "exe_path": "C:\\go2rtc\\bin\\ffmpeg.exe" }
 ```
 
 #### `process_exited`
-A known process disappeared from the process list.
-
 ```json
 { "pid": 1235, "name": "ffmpeg.exe", "uptime_seconds": 1195 }
 ```
 
 #### `resource_sample`
 Written every `resource_poll_interval_ms`.
-
 ```json
 {
   "processes": [
-    {
-      "pid": 1234, "name": "go2rtc.exe",
-      "cpu_percent": 12.3, "memory_mb": 84.2,
-      "handles": 312, "threads": 18
-    }
+    { "pid": 1234, "name": "go2rtc.exe",
+      "cpu_percent": 12.3, "memory_mb": 84.2, "handles": 312, "threads": 18 }
   ],
   "total_cpu_percent": 12.3,
-  "total_memory_mb":   84.2
+  "total_memory_mb": 84.2
 }
 ```
 
 #### `process_tree_snapshot`
 Written every `snapshot_interval_ms`.
-
 ```json
 {
   "count": 1,
   "processes": [
-    {
-      "pid": 1234, "name": "go2rtc.exe",
-      "exe_path": "C:\\go2rtc\\go2rtc.exe",
-      "started_at": "2026-03-20T09:45:00.000Z",
-      "threads": 18, "memory_mb": 0.0
-    }
+    { "pid": 1234, "name": "go2rtc.exe", "exe_path": "C:\\go2rtc\\go2rtc.exe",
+      "started_at": "2026-03-20T09:45:00.000Z", "threads": 18, "memory_mb": 0.0 }
   ]
 }
 ```
 
 #### `cpu_alert` / `memory_alert`
-Per-process threshold exceeded — emitted once per offending sample.
-
 ```json
 { "msg": "go2rtc.exe cpu=91.2% exceeds threshold 80%" }
 ```
@@ -222,74 +239,102 @@ Per-process threshold exceeded — emitted once per offending sample.
 
 ### system-monitor events
 
-#### `system_resource_sample`
-Written every `poll_interval_ms`.  Shows what is *available* to new workloads.
-
+#### `system_info`
+Written once at startup — static facts about the host.
 ```json
 {
-  "cpu_used_percent":    34.5,
-  "cpu_free_percent":    65.5,
-  "memory_total_mb":     16384.0,
-  "memory_used_mb":      9200.0,
-  "memory_free_mb":      7184.0,
-  "memory_free_percent": 43.8,
+  "cpu_brand": "Intel Core i7-12700K", "cpu_arch": "x86_64", "cpu_core_count": 12,
+  "memory_total_mb": 32768, "swap_total_mb": 8192,
+  "os_name": "Windows", "os_version": "11", "hostname": "SERVER-01",
+  "gpus": ["NVIDIA GeForce RTX 4090"], "gpu_monitoring": "nvml"
+}
+```
+
+#### `system_resource_sample`
+Written every `poll_interval_ms`.
+```json
+{
+  "cpu_used_percent": 34.5,  "cpu_free_percent": 65.5,
+  "cores": [
+    { "id": 0, "used_percent": 45.2, "frequency_mhz": 3600 }
+  ],
+  "memory_total_mb": 32768, "memory_used_mb": 9200,
+  "memory_free_mb": 7184,   "memory_free_percent": 43.8,
+  "swap_total_mb": 8192,    "swap_used_mb": 512,   "swap_used_percent": 6.25,
+  "network": [
+    { "interface": "Ethernet",
+      "rx_mb_per_sec": 9.5, "tx_mb_per_sec": 2.1,
+      "rx_errors": 0, "tx_errors": 0 }
+  ],
   "disks": [
-    {
-      "path": "C:\\",
-      "total_gb":     476.84,
-      "free_gb":      210.12,
-      "free_percent": 44.06
-    }
+    { "path": "C:\\", "total_gb": 476.84, "free_gb": 210.12, "free_percent": 44.06 }
+  ],
+  "gpus": [
+    { "index": 0, "name": "NVIDIA GeForce RTX 4090",
+      "gpu_used_percent": 42.0, "vram_total_mb": 24576, "vram_used_mb": 8192,
+      "vram_free_mb": 16384, "vram_free_percent": 66.67,
+      "temperature_c": 68, "encoder_percent": 35, "decoder_percent": 10, "power_w": 180 }
   ]
 }
 ```
 
-#### `cpu_headroom_alert`
-Free CPU headroom fell below `log.cpu_alert_free_percent`.
+#### Alert events
 
-```json
-{ "msg": "CPU headroom 14.3% below threshold 20%" }
-```
+| Event | Level | Example message |
+|-------|-------|-----------------|
+| `cpu_headroom_alert` | WARN / ERROR | `CPU headroom 8% below threshold 10%` |
+| `cpu_core_alert` | WARN / ERROR | `Core 2 used 97.1% above threshold 95%` |
+| `memory_headroom_alert` | WARN / ERROR | `free RAM 420 MB below threshold 500 MB` |
+| `swap_alert` | WARN / ERROR | `swap used 75% above threshold 70%` |
+| `disk_headroom_alert` | WARN / ERROR | `disk C:\ free 8.1 GB below threshold 10 GB` |
+| `network_rx_alert` | WARN | `Ethernet RX 95.2 MB/s above threshold 80 MB/s` |
+| `network_error_alert` | ERROR | `Ethernet errors: rx=3 tx=0` |
+| `gpu_util_alert` | WARN / ERROR | `GPU RTX 4090 utilisation 96% above threshold 95%` |
+| `gpu_vram_alert` | WARN / ERROR | `GPU RTX 4090 VRAM free 180 MB below threshold 200 MB` |
+| `gpu_temp_alert` | WARN / ERROR | `GPU RTX 4090 temperature 91°C above threshold 90°C` |
+| `gpu_encoder_alert` | WARN | `GPU RTX 4090 NVENC encoder 85% above threshold 80%` |
 
-#### `memory_headroom_alert`
-Available RAM fell below `log.memory_alert_free_mb`.
+---
 
-```json
-{ "msg": "free RAM 412 MB below threshold 500 MB" }
-```
+## GPU monitoring (NVIDIA)
 
-#### `disk_headroom_alert`
-Free disk space on a watched drive fell below `log.disk_alert_free_gb`.
+Build with `--features nvidia` to enable NVML-based GPU monitoring.
 
-```json
-{ "msg": "disk C:\\ free 8.3 GB below threshold 10 GB" }
-```
+| Metric | Why it matters for streaming |
+|--------|------------------------------|
+| GPU utilisation % | Overall load |
+| NVENC encoder % | Hardware encoder saturation (go2rtc streams) |
+| NVDEC decoder % | Hardware decoder saturation (ffmpeg transcode) |
+| VRAM free | Running out stops hardware encoding |
+| Temperature | Thermal throttle causes frame drops |
+| Power draw | Context for thermal readings |
+
+NVML is part of the NVIDIA driver — no extra install required.
+AMD and Intel GPUs are listed in `system_info` but real-time metrics require their respective vendor SDKs (not yet implemented).
 
 ---
 
 ## Grep examples
 
 ```powershell
-# All WARN/ERROR entries across both monitors
+# All WARN and ERROR entries across both monitors
 Get-ChildItem C:\monitor\*.jsonl | Get-Content |
   ConvertFrom-Json | Where-Object level -ne INFO
 
-# Free CPU headroom over the last hour (system-monitor)
-Get-Content C:\monitor\sys_resources.*.jsonl |
-  ConvertFrom-Json |
-  Where-Object event -eq system_resource_sample |
-  Select-Object ts, cpu_free_percent |
-  Select-Object -Last 120   # 120 × 30 s = 1 hour
-
-# Average available RAM over last 10 samples
+# Free CPU headroom over the last hour (120 samples × 30 s)
 Get-Content C:\monitor\sys_resources.0.jsonl |
   ConvertFrom-Json |
   Where-Object event -eq system_resource_sample |
-  Select-Object -Last 10 |
-  ForEach-Object { $_.memory_free_mb } |
-  Measure-Object -Average
+  Select-Object -Last 120 | Select-Object ts, cpu_free_percent
 
-# All processes spawned today (process-monitor)
+# NVENC encoder utilisation trend
+Get-Content C:\monitor\sys_resources.0.jsonl |
+  ConvertFrom-Json |
+  Where-Object event -eq system_resource_sample |
+  ForEach-Object { $_.gpus[0].encoder_percent } |
+  Measure-Object -Average -Maximum
+
+# All processes spawned today
 Get-Content C:\monitor\proc_resources.*.jsonl |
   ConvertFrom-Json | Where-Object event -eq process_spawned
 

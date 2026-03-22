@@ -5,12 +5,12 @@
 //! (see lib.rs) and the Arc<RwLock<Config>> is swapped atomically.
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 // ── Top-level ─────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
     #[serde(default)]
     pub log_rotation: LogRotationConfig,
@@ -30,7 +30,7 @@ impl Config {
 
 // ── Log rotation ──────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LogRotationConfig {
     #[serde(default = "default_max_mb")]
     pub max_file_size_mb: u64,
@@ -50,7 +50,7 @@ fn default_keep()   -> u32 { 5  }
 
 // ── Monitors section ──────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MonitorsConfig {
     pub process_monitor: ProcessMonitorConfig,
 
@@ -60,7 +60,7 @@ pub struct MonitorsConfig {
 
 // ── process-monitor ───────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ProcessMonitorConfig {
     #[serde(default = "yes")]
     pub enabled: bool,
@@ -84,7 +84,7 @@ pub struct ProcessMonitorConfig {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ProcessMonitorLogConfig {
     #[serde(default = "yes")] pub cpu_percent:   bool,
     #[serde(default = "yes")] pub memory_mb:     bool,
@@ -121,7 +121,7 @@ impl Default for ProcessMonitorLogConfig {
 
 // ── system-monitor ────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SystemMonitorConfig {
     #[serde(default = "yes")]
     pub enabled: bool,
@@ -167,7 +167,7 @@ impl Default for SystemMonitorConfig {
 /// Two-tier alerting:
 /// - `*_warn_*`  → logged at **WARN** level (approaching a limit)
 /// - `*_alert_*` → logged at **ERROR** level (limit breached, action needed)
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SystemMonitorLogConfig {
     // ── Toggle groups ─────────────────────────────────────────────────────────
     #[serde(default = "yes")] pub cpu:         bool,

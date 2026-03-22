@@ -323,201 +323,212 @@ fn main() -> Result<()> {
         let watch_ifaces = sm_cfg.watch_network_interfaces.clone();
         let poll_interval = Duration::from_millis(sm_cfg.poll_interval_ms);
 
-        let elapsed_secs = tick.elapsed().as_secs_f64().max(0.001);
-
-        // ── CPU ───────────────────────────────────────────────────────────────
+        // Always refresh CPU to keep the measurement window accurate even when
+        // sampling is paused (so the next sample after re-enabling is correct).
         sys.refresh_cpu_all();
-        let cpu_used = sys.global_cpu_usage() as f64;
-        let cpu_free = (100.0 - cpu_used).max(0.0);
 
-        let cores: Vec<CoreSample> = if log_cfg.cpu_per_core {
-            sys.cpus().iter().enumerate().map(|(id, cpu)| CoreSample {
-                id,
-                used_percent:  round2(cpu.cpu_usage() as f64),
-                frequency_mhz: cpu.frequency(),
-            }).collect()
-        } else {
-            Vec::new()
-        };
+        // Only collect, write, and alert when the interval is active (> 0).
+        if sm_cfg.poll_interval_ms > 0 {
+            let elapsed_secs = tick.elapsed().as_secs_f64().max(0.001);
 
-        // ── Memory ────────────────────────────────────────────────────────────
-        sys.refresh_memory();
-        let mem_total_mb = sys.total_memory()     as f64 / 1_048_576.0;
-        let mem_used_mb  = sys.used_memory()      as f64 / 1_048_576.0;
-        let mem_free_mb  = sys.available_memory() as f64 / 1_048_576.0;
-        let mem_free_pct = pct(mem_free_mb, mem_total_mb);
+            // ── CPU ───────────────────────────────────────────────────────────
+            let cpu_used = sys.global_cpu_usage() as f64;
+            let cpu_free = (100.0 - cpu_used).max(0.0);
 
-        // ── Swap / pagefile ───────────────────────────────────────────────────
-        let swap_total_mb = sys.total_swap() as f64 / 1_048_576.0;
-        let swap_used_mb  = sys.used_swap()  as f64 / 1_048_576.0;
-        let swap_used_pct = pct(swap_used_mb, swap_total_mb);
+            let cores: Vec<CoreSample> = if log_cfg.cpu_per_core {
+                sys.cpus().iter().enumerate().map(|(id, cpu)| CoreSample {
+                    id,
+                    used_percent:  round2(cpu.cpu_usage() as f64),
+                    frequency_mhz: cpu.frequency(),
+                }).collect()
+            } else {
+                Vec::new()
+            };
 
-        // ── Network ───────────────────────────────────────────────────────────
-        networks.refresh();
-        let net_samples: Vec<NetworkSample> = if log_cfg.network {
-            networks.iter()
-                .filter(|(name, _)| iface_included(name, &watch_ifaces))
-                .map(|(name, data)| NetworkSample {
-                    interface:     name.clone(),
-                    rx_mb_per_sec: round2(data.received()    as f64 / 1_048_576.0 / elapsed_secs),
-                    tx_mb_per_sec: round2(data.transmitted() as f64 / 1_048_576.0 / elapsed_secs),
-                    rx_errors:     data.errors_on_received(),
-                    tx_errors:     data.errors_on_transmitted(),
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+            // ── Memory ────────────────────────────────────────────────────────
+            sys.refresh_memory();
+            let mem_total_mb = sys.total_memory()     as f64 / 1_048_576.0;
+            let mem_used_mb  = sys.used_memory()      as f64 / 1_048_576.0;
+            let mem_free_mb  = sys.available_memory() as f64 / 1_048_576.0;
+            let mem_free_pct = pct(mem_free_mb, mem_total_mb);
 
-        // ── Disks ─────────────────────────────────────────────────────────────
-        let disks = Disks::new_with_refreshed_list();
-        let disk_samples: Vec<DiskSample> = if log_cfg.disk {
-            disks.list().iter()
-                .filter(|d| disk_included(&d.mount_point().to_string_lossy(), &watch_disks))
-                .map(|d| {
-                    let total_gb = d.total_space()     as f64 / 1_073_741_824.0;
-                    let free_gb  = d.available_space() as f64 / 1_073_741_824.0;
-                    DiskSample {
-                        path:         d.mount_point().to_string_lossy().into_owned(),
-                        total_gb:     round2(total_gb),
-                        free_gb:      round2(free_gb),
-                        free_percent: round2(pct(free_gb, total_gb)),
-                    }
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+            // ── Swap / pagefile ───────────────────────────────────────────────
+            let swap_total_mb = sys.total_swap() as f64 / 1_048_576.0;
+            let swap_used_mb  = sys.used_swap()  as f64 / 1_048_576.0;
+            let swap_used_pct = pct(swap_used_mb, swap_total_mb);
 
-        // ── GPU (NVIDIA via NVML) ─────────────────────────────────────────────
-        let gpu_samples: Vec<GpuSample> = if log_cfg.gpu {
-            gpu_monitor.sample()
-        } else {
-            Vec::new()
-        };
+            // ── Network ───────────────────────────────────────────────────────
+            networks.refresh();
+            let net_samples: Vec<NetworkSample> = if log_cfg.network {
+                networks.iter()
+                    .filter(|(name, _)| iface_included(name, &watch_ifaces))
+                    .map(|(name, data)| NetworkSample {
+                        interface:     name.clone(),
+                        rx_mb_per_sec: round2(data.received()    as f64 / 1_048_576.0 / elapsed_secs),
+                        tx_mb_per_sec: round2(data.transmitted() as f64 / 1_048_576.0 / elapsed_secs),
+                        rx_errors:     data.errors_on_received(),
+                        tx_errors:     data.errors_on_transmitted(),
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
 
-        // ── Write sample ──────────────────────────────────────────────────────
-        send(&tx, &LogEntry::info(MONITOR, "system_resource_sample", SystemResourceSampleData {
-            cpu_used_percent:    round2(cpu_used),
-            cpu_free_percent:    round2(cpu_free),
-            cores:               cores.clone(),
-            memory_total_mb:     round2(mem_total_mb),
-            memory_used_mb:      round2(mem_used_mb),
-            memory_free_mb:      round2(mem_free_mb),
-            memory_free_percent: round2(mem_free_pct),
-            swap_total_mb:       round2(swap_total_mb),
-            swap_used_mb:        round2(swap_used_mb),
-            swap_used_percent:   round2(swap_used_pct),
-            network:             net_samples.clone(),
-            disks:               disk_samples.clone(),
-            gpus:                gpu_samples.clone(),
-        }));
+            // ── Disks ─────────────────────────────────────────────────────────
+            let disks = Disks::new_with_refreshed_list();
+            let disk_samples: Vec<DiskSample> = if log_cfg.disk {
+                disks.list().iter()
+                    .filter(|d| disk_included(&d.mount_point().to_string_lossy(), &watch_disks))
+                    .map(|d| {
+                        let total_gb = d.total_space()     as f64 / 1_073_741_824.0;
+                        let free_gb  = d.available_space() as f64 / 1_073_741_824.0;
+                        DiskSample {
+                            path:         d.mount_point().to_string_lossy().into_owned(),
+                            total_gb:     round2(total_gb),
+                            free_gb:      round2(free_gb),
+                            free_percent: round2(pct(free_gb, total_gb)),
+                        }
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
 
-        // ── Threshold alerts ──────────────────────────────────────────────────
+            // ── GPU (NVIDIA via NVML) ─────────────────────────────────────────
+            let gpu_samples: Vec<GpuSample> = if log_cfg.gpu {
+                gpu_monitor.sample()
+            } else {
+                Vec::new()
+            };
 
-        check_warn_alert(&tx, MONITOR, "cpu_headroom_alert",
-            cpu_free,
-            log_cfg.cpu_warn_free_percent, log_cfg.cpu_alert_free_percent,
-            |v, th| format!("CPU headroom {v:.1}% below threshold {th:.0}%"),
-            ThresholdDir::Below);
+            // ── Write sample ──────────────────────────────────────────────────
+            send(&tx, &LogEntry::info(MONITOR, "system_resource_sample", SystemResourceSampleData {
+                cpu_used_percent:    round2(cpu_used),
+                cpu_free_percent:    round2(cpu_free),
+                cores:               cores.clone(),
+                memory_total_mb:     round2(mem_total_mb),
+                memory_used_mb:      round2(mem_used_mb),
+                memory_free_mb:      round2(mem_free_mb),
+                memory_free_percent: round2(mem_free_pct),
+                swap_total_mb:       round2(swap_total_mb),
+                swap_used_mb:        round2(swap_used_mb),
+                swap_used_percent:   round2(swap_used_pct),
+                network:             net_samples.clone(),
+                disks:               disk_samples.clone(),
+                gpus:                gpu_samples.clone(),
+            }));
 
-        if log_cfg.cpu_per_core {
-            for core in &cores {
-                check_warn_alert(&tx, MONITOR, "cpu_core_alert",
-                    core.used_percent,
-                    log_cfg.cpu_core_warn_percent, log_cfg.cpu_core_alert_percent,
-                    |v, th| format!("Core {} used {v:.1}% above threshold {th:.0}%", core.id),
-                    ThresholdDir::Above);
-            }
-        }
+            // ── Threshold alerts ──────────────────────────────────────────────
 
-        check_warn_alert(&tx, MONITOR, "memory_headroom_alert",
-            mem_free_mb,
-            log_cfg.memory_warn_free_mb, log_cfg.memory_alert_free_mb,
-            |v, th| format!("free RAM {v:.0} MB below threshold {th:.0} MB"),
-            ThresholdDir::Below);
-
-        check_warn_alert(&tx, MONITOR, "swap_alert",
-            swap_used_pct,
-            log_cfg.swap_warn_used_percent, log_cfg.swap_alert_used_percent,
-            |v, th| format!("swap used {v:.1}% above threshold {th:.0}%"),
-            ThresholdDir::Above);
-
-        for disk in &disk_samples {
-            check_warn_alert(&tx, MONITOR, "disk_headroom_alert",
-                disk.free_gb,
-                log_cfg.disk_warn_free_gb, log_cfg.disk_alert_free_gb,
-                |v, th| format!("disk {} free {v:.1} GB below threshold {th:.0} GB", disk.path),
-                ThresholdDir::Below);
-        }
-
-        if let Some(th) = log_cfg.network_rx_warn_mbps {
-            for n in &net_samples {
-                if n.rx_mb_per_sec > th {
-                    send(&tx, &LogEntry::warn(MONITOR, "network_rx_alert", WarningData {
-                        msg: format!("{} RX {:.2} MB/s above threshold {th:.0} MB/s", n.interface, n.rx_mb_per_sec),
-                        detail: None,
-                    }));
-                }
-            }
-        }
-        if let Some(th) = log_cfg.network_tx_warn_mbps {
-            for n in &net_samples {
-                if n.tx_mb_per_sec > th {
-                    send(&tx, &LogEntry::warn(MONITOR, "network_tx_alert", WarningData {
-                        msg: format!("{} TX {:.2} MB/s above threshold {th:.0} MB/s", n.interface, n.tx_mb_per_sec),
-                        detail: None,
-                    }));
-                }
-            }
-        }
-        if log_cfg.network_error_alert {
-            for n in &net_samples {
-                if n.rx_errors > 0 || n.tx_errors > 0 {
-                    send(&tx, &LogEntry::error(MONITOR, "network_error_alert", WarningData {
-                        msg: format!("{} errors: rx={} tx={}", n.interface, n.rx_errors, n.tx_errors),
-                        detail: None,
-                    }));
-                }
-            }
-        }
-
-        // ── GPU alerts ────────────────────────────────────────────────────────
-        for gpu in &gpu_samples {
-            check_warn_alert(&tx, MONITOR, "gpu_util_alert",
-                gpu.gpu_used_percent,
-                log_cfg.gpu_warn_util_percent, log_cfg.gpu_alert_util_percent,
-                |v, th| format!("GPU {} utilisation {v:.1}% above threshold {th:.0}%", gpu.name),
-                ThresholdDir::Above);
-
-            check_warn_alert(&tx, MONITOR, "gpu_vram_alert",
-                gpu.vram_free_mb,
-                log_cfg.gpu_vram_warn_free_mb, log_cfg.gpu_vram_alert_free_mb,
-                |v, th| format!("GPU {} VRAM free {v:.0} MB below threshold {th:.0} MB", gpu.name),
+            check_warn_alert(&tx, MONITOR, "cpu_headroom_alert",
+                cpu_free,
+                log_cfg.cpu_warn_free_percent, log_cfg.cpu_alert_free_percent,
+                |v, th| format!("CPU headroom {v:.1}% below threshold {th:.0}%"),
                 ThresholdDir::Below);
 
-            check_warn_alert(&tx, MONITOR, "gpu_temp_alert",
-                gpu.temperature_c as f64,
-                log_cfg.gpu_temp_warn_c, log_cfg.gpu_temp_alert_c,
-                |v, th| format!("GPU {} temperature {v:.0}°C above threshold {th:.0}°C", gpu.name),
+            if log_cfg.cpu_per_core {
+                for core in &cores {
+                    check_warn_alert(&tx, MONITOR, "cpu_core_alert",
+                        core.used_percent,
+                        log_cfg.cpu_core_warn_percent, log_cfg.cpu_core_alert_percent,
+                        |v, th| format!("Core {} used {v:.1}% above threshold {th:.0}%", core.id),
+                        ThresholdDir::Above);
+                }
+            }
+
+            check_warn_alert(&tx, MONITOR, "memory_headroom_alert",
+                mem_free_mb,
+                log_cfg.memory_warn_free_mb, log_cfg.memory_alert_free_mb,
+                |v, th| format!("free RAM {v:.0} MB below threshold {th:.0} MB"),
+                ThresholdDir::Below);
+
+            check_warn_alert(&tx, MONITOR, "swap_alert",
+                swap_used_pct,
+                log_cfg.swap_warn_used_percent, log_cfg.swap_alert_used_percent,
+                |v, th| format!("swap used {v:.1}% above threshold {th:.0}%"),
                 ThresholdDir::Above);
 
-            if let Some(enc) = gpu.encoder_percent {
-                if let Some(th) = log_cfg.gpu_encoder_warn_percent {
-                    if enc as f64 > th {
-                        send(&tx, &LogEntry::warn(MONITOR, "gpu_encoder_alert", WarningData {
-                            msg: format!("GPU {} NVENC encoder {enc}% above threshold {th:.0}%", gpu.name),
+            for disk in &disk_samples {
+                check_warn_alert(&tx, MONITOR, "disk_headroom_alert",
+                    disk.free_gb,
+                    log_cfg.disk_warn_free_gb, log_cfg.disk_alert_free_gb,
+                    |v, th| format!("disk {} free {v:.1} GB below threshold {th:.0} GB", disk.path),
+                    ThresholdDir::Below);
+            }
+
+            if let Some(th) = log_cfg.network_rx_warn_mbps {
+                for n in &net_samples {
+                    if n.rx_mb_per_sec > th {
+                        send(&tx, &LogEntry::warn(MONITOR, "network_rx_alert", WarningData {
+                            msg: format!("{} RX {:.2} MB/s above threshold {th:.0} MB/s", n.interface, n.rx_mb_per_sec),
                             detail: None,
                         }));
                     }
                 }
             }
+            if let Some(th) = log_cfg.network_tx_warn_mbps {
+                for n in &net_samples {
+                    if n.tx_mb_per_sec > th {
+                        send(&tx, &LogEntry::warn(MONITOR, "network_tx_alert", WarningData {
+                            msg: format!("{} TX {:.2} MB/s above threshold {th:.0} MB/s", n.interface, n.tx_mb_per_sec),
+                            detail: None,
+                        }));
+                    }
+                }
+            }
+            if log_cfg.network_error_alert {
+                for n in &net_samples {
+                    if n.rx_errors > 0 || n.tx_errors > 0 {
+                        send(&tx, &LogEntry::error(MONITOR, "network_error_alert", WarningData {
+                            msg: format!("{} errors: rx={} tx={}", n.interface, n.rx_errors, n.tx_errors),
+                            detail: None,
+                        }));
+                    }
+                }
+            }
+
+            // ── GPU alerts ────────────────────────────────────────────────────
+            for gpu in &gpu_samples {
+                check_warn_alert(&tx, MONITOR, "gpu_util_alert",
+                    gpu.gpu_used_percent,
+                    log_cfg.gpu_warn_util_percent, log_cfg.gpu_alert_util_percent,
+                    |v, th| format!("GPU {} utilisation {v:.1}% above threshold {th:.0}%", gpu.name),
+                    ThresholdDir::Above);
+
+                check_warn_alert(&tx, MONITOR, "gpu_vram_alert",
+                    gpu.vram_free_mb,
+                    log_cfg.gpu_vram_warn_free_mb, log_cfg.gpu_vram_alert_free_mb,
+                    |v, th| format!("GPU {} VRAM free {v:.0} MB below threshold {th:.0} MB", gpu.name),
+                    ThresholdDir::Below);
+
+                check_warn_alert(&tx, MONITOR, "gpu_temp_alert",
+                    gpu.temperature_c as f64,
+                    log_cfg.gpu_temp_warn_c, log_cfg.gpu_temp_alert_c,
+                    |v, th| format!("GPU {} temperature {v:.0}°C above threshold {th:.0}°C", gpu.name),
+                    ThresholdDir::Above);
+
+                if let Some(enc) = gpu.encoder_percent {
+                    if let Some(th) = log_cfg.gpu_encoder_warn_percent {
+                        if enc as f64 > th {
+                            send(&tx, &LogEntry::warn(MONITOR, "gpu_encoder_alert", WarningData {
+                                msg: format!("GPU {} NVENC encoder {enc}% above threshold {th:.0}%", gpu.name),
+                                detail: None,
+                            }));
+                        }
+                    }
+                }
+            }
         }
 
-        // ── Sleep for the remainder of the poll interval ──────────────────────
+        // ── Sleep — fall back to 1 s when poll interval is off (0) ────────────
+        let sleep_for = if poll_interval.is_zero() {
+            Duration::from_secs(1)
+        } else {
+            poll_interval
+        };
         let elapsed = tick.elapsed();
-        if elapsed < poll_interval {
-            thread::sleep(poll_interval - elapsed);
+        if elapsed < sleep_for {
+            thread::sleep(sleep_for - elapsed);
         }
     }
 

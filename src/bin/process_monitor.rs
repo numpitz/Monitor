@@ -221,53 +221,57 @@ fn main() -> Result<()> {
             }
         }
 
-        // ── 2. Sample resources ───────────────────────────────────────────────
-        let known = discovery.known_processes();
-        if !known.is_empty() {
-            let mut samples      = Vec::with_capacity(known.len());
-            let mut total_cpu    = 0.0_f64;
-            let mut total_mem_mb = 0.0_f64;
+        // ── 2. Sample resources (skipped when resource_poll_interval_ms == 0) ───
+        if pm_cfg.resource_poll_interval_ms > 0 {
+            let known = discovery.known_processes();
+            if !known.is_empty() {
+                let mut samples      = Vec::with_capacity(known.len());
+                let mut total_cpu    = 0.0_f64;
+                let mut total_mem_mb = 0.0_f64;
 
-            for info in known.values() {
-                if let Some(s) = sampler.sample(info.pid, &info.name, info.thread_count) {
-                    // Threshold alerts
-                    if let Some(th) = log_cfg.cpu_alert_threshold_percent {
-                        if s.cpu_percent > th {
-                            send(&tx, &LogEntry::warn(MONITOR, "cpu_alert", WarningData {
-                                msg: format!(
-                                    "{} cpu={:.1}% exceeds threshold {:.0}%",
-                                    s.name, s.cpu_percent, th
-                                ),
-                                detail: None,
-                            }));
+                for info in known.values() {
+                    if let Some(s) = sampler.sample(info.pid, &info.name, info.thread_count) {
+                        if let Some(th) = log_cfg.cpu_alert_threshold_percent {
+                            if s.cpu_percent > th {
+                                send(&tx, &LogEntry::warn(MONITOR, "cpu_alert", WarningData {
+                                    msg: format!(
+                                        "{} cpu={:.1}% exceeds threshold {:.0}%",
+                                        s.name, s.cpu_percent, th
+                                    ),
+                                    detail: None,
+                                }));
+                            }
                         }
-                    }
-                    if let Some(th) = log_cfg.memory_alert_mb {
-                        if s.memory_mb > th {
-                            send(&tx, &LogEntry::warn(MONITOR, "memory_alert", WarningData {
-                                msg: format!(
-                                    "{} mem={:.1} MB exceeds threshold {:.0} MB",
-                                    s.name, s.memory_mb, th
-                                ),
-                                detail: None,
-                            }));
+                        if let Some(th) = log_cfg.memory_alert_mb {
+                            if s.memory_mb > th {
+                                send(&tx, &LogEntry::warn(MONITOR, "memory_alert", WarningData {
+                                    msg: format!(
+                                        "{} mem={:.1} MB exceeds threshold {:.0} MB",
+                                        s.name, s.memory_mb, th
+                                    ),
+                                    detail: None,
+                                }));
+                            }
                         }
+                        total_cpu    += s.cpu_percent;
+                        total_mem_mb += s.memory_mb;
+                        samples.push(s);
                     }
-                    total_cpu    += s.cpu_percent;
-                    total_mem_mb += s.memory_mb;
-                    samples.push(s);
                 }
-            }
 
-            send(&tx, &LogEntry::info(MONITOR, "resource_sample", ResourceSampleData {
-                processes:         samples,
-                total_cpu_percent: (total_cpu   * 100.0).round() / 100.0,
-                total_memory_mb:   (total_mem_mb * 100.0).round() / 100.0,
-            }));
+                send(&tx, &LogEntry::info(MONITOR, "resource_sample", ResourceSampleData {
+                    processes:         samples,
+                    total_cpu_percent: (total_cpu   * 100.0).round() / 100.0,
+                    total_memory_mb:   (total_mem_mb * 100.0).round() / 100.0,
+                }));
+            }
         }
 
-        // ── 3. Process tree snapshot (every snapshot_interval) ────────────────
-        if log_cfg.snapshot && last_snapshot.elapsed() >= snapshot_interval {
+        // ── 3. Snapshot (skipped when snapshot_interval_ms == 0) ─────────────
+        if log_cfg.snapshot
+            && pm_cfg.snapshot_interval_ms > 0
+            && last_snapshot.elapsed() >= snapshot_interval
+        {
             let entries: Vec<ProcessSnapshotEntry> = discovery
                 .known_processes()
                 .values()
@@ -277,7 +281,7 @@ fn main() -> Result<()> {
                     exe_path:   p.exe_path.clone(),
                     started_at: p.started_at,
                     threads:    p.thread_count,
-                    memory_mb:  0.0, // see resource_sample for live values
+                    memory_mb:  0.0,
                 })
                 .collect();
 
@@ -289,10 +293,15 @@ fn main() -> Result<()> {
             last_snapshot = Instant::now();
         }
 
-        // ── 4. Sleep for the remainder of the poll interval ───────────────────
+        // ── 4. Sleep — fall back to 1 s when poll interval is off (0) ─────────
+        let sleep_for = if poll_interval.is_zero() {
+            Duration::from_secs(1)
+        } else {
+            poll_interval
+        };
         let elapsed = tick.elapsed();
-        if elapsed < poll_interval {
-            thread::sleep(poll_interval - elapsed);
+        if elapsed < sleep_for {
+            thread::sleep(sleep_for - elapsed);
         }
     }
 
