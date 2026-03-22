@@ -2,7 +2,7 @@
 //!
 //! All fields have sane defaults so the config can be minimal.
 //! The file is re-read on disk change by the config-watcher thread
-//! (see main.rs) and the Arc<RwLock<Config>> is swapped atomically.
+//! (see lib.rs) and the Arc<RwLock<Config>> is swapped atomically.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -45,22 +45,27 @@ impl Default for LogRotationConfig {
     }
 }
 
-fn default_max_mb()  -> u64 { 10 }
-fn default_keep()    -> u32 { 5  }
+fn default_max_mb() -> u64 { 10 }
+fn default_keep()   -> u32 { 5  }
 
 // ── Monitors section ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct MonitorsConfig {
     pub process_monitor: ProcessMonitorConfig,
+
+    #[serde(default)]
+    pub system_monitor: SystemMonitorConfig,
 }
+
+// ── process-monitor ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProcessMonitorConfig {
     #[serde(default = "yes")]
     pub enabled: bool,
 
-    #[serde(default = "default_log_file")]
+    #[serde(default = "default_proc_log_file")]
     pub log_file: String,
 
     /// How often to sample CPU / memory / handles (milliseconds).
@@ -101,20 +106,93 @@ pub struct ProcessMonitorLogConfig {
 impl Default for ProcessMonitorLogConfig {
     fn default() -> Self {
         Self {
-            cpu_percent:              true,
-            memory_mb:                true,
-            handle_count:             true,
-            thread_count:             true,
-            process_spawn:            true,
-            process_exit:             true,
-            snapshot:                 true,
+            cpu_percent:                 true,
+            memory_mb:                   true,
+            handle_count:                true,
+            thread_count:                true,
+            process_spawn:               true,
+            process_exit:                true,
+            snapshot:                    true,
             cpu_alert_threshold_percent: None,
-            memory_alert_mb:          None,
+            memory_alert_mb:             None,
         }
     }
 }
 
-fn yes()                    -> bool   { true }
-fn default_log_file()       -> String { "proc_resources.jsonl".into() }
-fn default_resource_poll_ms() -> u64  { 5_000 }
-fn default_snapshot_ms()    -> u64    { 60_000 }
+// ── system-monitor ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SystemMonitorConfig {
+    #[serde(default = "yes")]
+    pub enabled: bool,
+
+    #[serde(default = "default_sys_log_file")]
+    pub log_file: String,
+
+    /// How often to sample system-wide CPU, RAM and disk (milliseconds).
+    /// Default 30 s — system resources change slowly.
+    #[serde(default = "default_sys_poll_ms")]
+    pub poll_interval_ms: u64,
+
+    /// Disk mount points to measure free space on (e.g. `["C:\\"]`).
+    /// An empty list means *all* mounted disks are reported.
+    #[serde(default)]
+    pub watch_disks: Vec<String>,
+
+    #[serde(default)]
+    pub log: SystemMonitorLogConfig,
+}
+
+impl Default for SystemMonitorConfig {
+    fn default() -> Self {
+        Self {
+            enabled:          true,
+            log_file:         default_sys_log_file(),
+            poll_interval_ms: default_sys_poll_ms(),
+            watch_disks:      Vec::new(),
+            log:              SystemMonitorLogConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SystemMonitorLogConfig {
+    #[serde(default = "yes")] pub cpu:    bool,
+    #[serde(default = "yes")] pub memory: bool,
+    #[serde(default = "yes")] pub disk:   bool,
+
+    /// Emit a `cpu_headroom_alert` when free CPU headroom falls below this %.
+    #[serde(default)]
+    pub cpu_alert_free_percent: Option<f64>,
+
+    /// Emit a `memory_headroom_alert` when available RAM falls below this MB.
+    #[serde(default)]
+    pub memory_alert_free_mb: Option<f64>,
+
+    /// Emit a `disk_headroom_alert` when free space on any watched disk falls
+    /// below this GB.
+    #[serde(default)]
+    pub disk_alert_free_gb: Option<f64>,
+}
+
+impl Default for SystemMonitorLogConfig {
+    fn default() -> Self {
+        Self {
+            cpu:                    true,
+            memory:                 true,
+            disk:                   true,
+            cpu_alert_free_percent: None,
+            memory_alert_free_mb:   None,
+            disk_alert_free_gb:     None,
+        }
+    }
+}
+
+// ── Defaults ──────────────────────────────────────────────────────────────────
+
+fn yes()                      -> bool   { true }
+fn default_proc_log_file()    -> String { "proc_resources.jsonl".into() }
+fn default_resource_poll_ms() -> u64    { 5_000 }
+fn default_snapshot_ms()      -> u64    { 60_000 }
+fn default_sys_log_file()     -> String { "sys_resources.jsonl".into() }
+fn default_sys_poll_ms()      -> u64    { 30_000 }

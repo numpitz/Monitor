@@ -42,6 +42,7 @@ pub struct LogWriter {
     max_size_bytes:   u64,
     keep_files:       u32,
     monitor_pid:      u32,
+    monitor_name:     &'static str, // written into every rotation marker
 }
 
 impl LogWriter {
@@ -49,12 +50,14 @@ impl LogWriter {
     ///
     /// * `log_file_name` – the config value, e.g. `"proc_resources.jsonl"`.
     /// * `monitor_pid`   – written into every rotation marker.
+    /// * `monitor_name`  – e.g. `"process_monitor"`, written into every rotation marker.
     pub fn new(
-        log_dir:      &Path,
+        log_dir:       &Path,
         log_file_name: &str,
-        max_size_mb:  u64,
-        keep_files:   u32,
-        monitor_pid:  u32,
+        max_size_mb:   u64,
+        keep_files:    u32,
+        monitor_pid:   u32,
+        monitor_name:  &'static str,
     ) -> Result<Self> {
         let base_name = log_file_name
             .strip_suffix(".jsonl")
@@ -87,6 +90,7 @@ impl LogWriter {
             max_size_bytes: max_size_mb * 1024 * 1024,
             keep_files,
             monitor_pid,
+            monitor_name,
         })
     }
 
@@ -199,7 +203,7 @@ impl LogWriter {
         let marker = serde_json::json!({
             "ts":             chrono::Utc::now()
                                 .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-            "monitor":        "process_monitor",
+            "monitor":        self.monitor_name,
             "event":          "monitor_start",
             "level":          "INFO",
             "pid":            self.monitor_pid,

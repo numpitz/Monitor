@@ -3,11 +3,12 @@
 //! Every log line is a `LogEntry<T>` serialised with serde_json.
 //! Using `#[serde(flatten)]` the `data` fields appear at the top level
 //! of each JSON object, keeping lines compact and easy to grep.
+//!
+//! `LogEntry::info / warn / error` take a `monitor` name so the same
+//! envelope works for both the process-monitor and system-monitor binaries.
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::Serialize;
-
-pub const MONITOR_NAME: &str = "process_monitor";
 
 fn serialize_utc_z<S>(dt: &DateTime<Utc>, s: S) -> Result<S::Ok, S::Error>
 where
@@ -46,18 +47,18 @@ pub struct LogEntry<'a, T: Serialize> {
 }
 
 impl<'a, T: Serialize> LogEntry<'a, T> {
-    pub fn info(event: &'a str, data: T) -> Self {
-        Self { ts: Utc::now(), monitor: MONITOR_NAME, event, level: Level::Info, data }
+    pub fn info(monitor: &'static str, event: &'a str, data: T) -> Self {
+        Self { ts: Utc::now(), monitor, event, level: Level::Info, data }
     }
-    pub fn warn(event: &'a str, data: T) -> Self {
-        Self { ts: Utc::now(), monitor: MONITOR_NAME, event, level: Level::Warn, data }
+    pub fn warn(monitor: &'static str, event: &'a str, data: T) -> Self {
+        Self { ts: Utc::now(), monitor, event, level: Level::Warn, data }
     }
-    pub fn error(event: &'a str, data: T) -> Self {
-        Self { ts: Utc::now(), monitor: MONITOR_NAME, event, level: Level::Error, data }
+    pub fn error(monitor: &'static str, event: &'a str, data: T) -> Self {
+        Self { ts: Utc::now(), monitor, event, level: Level::Error, data }
     }
 }
 
-// ── Per-event data structs ────────────────────────────────────────────────────
+// ── Shared event data (used by both monitors) ─────────────────────────────────
 
 /// Written as the very first entry in every log file (including after rotation).
 #[derive(Serialize)]
@@ -79,6 +80,22 @@ pub struct MonitorStopData {
     pub exit_code: i32,
 }
 
+/// Config file was reloaded from disk.
+#[derive(Serialize)]
+pub struct ConfigReloadedData {
+    pub path: String,
+}
+
+/// Non-fatal issue worth recording.
+#[derive(Serialize)]
+pub struct WarningData {
+    pub msg: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+// ── process-monitor event data ────────────────────────────────────────────────
+
 /// A new process appeared inside a watch folder.
 #[derive(Serialize)]
 pub struct ProcessSpawnedData {
@@ -90,9 +107,9 @@ pub struct ProcessSpawnedData {
 /// A previously-known process disappeared from the process list.
 #[derive(Serialize)]
 pub struct ProcessExitedData {
-    pub pid:             u32,
-    pub name:            String,
-    pub uptime_seconds:  u64,
+    pub pid:            u32,
+    pub name:           String,
+    pub uptime_seconds: u64,
 }
 
 /// One row in a resource_sample event.
@@ -133,16 +150,29 @@ pub struct TreeSnapshotData {
     pub processes: Vec<ProcessSnapshotEntry>,
 }
 
-/// Config file was reloaded from disk.
+// ── system-monitor event data ─────────────────────────────────────────────────
+
+/// One drive entry inside a `system_resource_sample` event.
 #[derive(Serialize)]
-pub struct ConfigReloadedData {
-    pub path: String,
+pub struct DiskSample {
+    pub path:         String,
+    pub total_gb:     f64,
+    pub free_gb:      f64,
+    /// free_gb / total_gb × 100
+    pub free_percent: f64,
 }
 
-/// Non-fatal issue worth recording.
+/// Written every `poll_interval_ms` by system-monitor.
 #[derive(Serialize)]
-pub struct WarningData {
-    pub msg: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
+pub struct SystemResourceSampleData {
+    /// Percentage of all logical CPU cores in use (0–100).
+    pub cpu_used_percent:    f64,
+    /// Headroom left for new workloads: 100 − used.
+    pub cpu_free_percent:    f64,
+    pub memory_total_mb:     f64,
+    pub memory_used_mb:      f64,
+    /// Available memory (free + reclaimable on Linux; "Available" on Windows).
+    pub memory_free_mb:      f64,
+    pub memory_free_percent: f64,
+    pub disks:               Vec<DiskSample>,
 }

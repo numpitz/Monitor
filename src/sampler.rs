@@ -20,7 +20,7 @@
 //! hidden CPU spikes from a runtime.  This was the primary reason for
 //! choosing Rust over Go or C# for this particular monitor.
 
-use crate::events::ProcessSample;
+use process_monitor::events::ProcessSample;
 use std::{collections::HashMap, time::Instant};
 
 #[cfg(windows)]
