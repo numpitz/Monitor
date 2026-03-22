@@ -1,14 +1,12 @@
-//! monitor-ui — egui configuration editor and process viewer for the monitor suite.
+//! monitor-ui — egui configuration editor and live viewer for the monitor suite.
 //!
 //! Usage:
 //!   monitor-ui.exe <LOG_DIR>
 //!
-//! Reads `<LOG_DIR>/monitor.config.json`, lets you edit poll intervals for both
-//! monitors, and writes the file back atomically.  The running monitors pick up
-//! the change immediately via their config-watcher thread — no restart needed.
-//!
-//! The lower panel reads the process-monitor NDJSON log and shows a live table
-//! of watched processes with their last-known CPU, memory, handles and threads.
+//! Three panels:
+//!   1. Configuration  — edit poll intervals and enabled flags for both monitors
+//!   2. Watched Processes — live table rebuilt from proc_resources.N.jsonl
+//!   3. System Resources  — last sample from sys_resources.N.jsonl with progress bars
 
 use eframe::egui;
 use process_monitor::config::Config;
@@ -29,7 +27,7 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Monitor Configuration")
-            .with_inner_size([620.0, 700.0])
+            .with_inner_size([640.0, 960.0])
             .with_resizable(true),
         ..Default::default()
     };
@@ -41,7 +39,7 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-// ── Process viewer row ────────────────────────────────────────────────────────
+// ── Data types for the viewers ────────────────────────────────────────────────
 
 #[derive(Default)]
 struct ProcessRow {
@@ -52,10 +50,47 @@ struct ProcessRow {
     handles:     u32,
     threads:     u32,
     /// HH:MM:SS of the last resource_sample that included this process
-    /// (or spawn time if it has never been sampled yet).
+    /// (or spawn / exit time when no sample is available).
     last_seen:   String,
     /// false once a `process_exited` event is seen for this PID.
     alive:       bool,
+}
+
+struct NetRow {
+    interface: String,
+    rx:        f64,
+    tx:        f64,
+    errors:    u64,
+}
+
+struct DiskRow {
+    path:     String,
+    total_gb: f64,
+    free_gb:  f64,
+    free_pct: f64,
+}
+
+struct GpuRow {
+    name:         String,
+    util_pct:     f64,
+    vram_free_mb: f64,
+    temp_c:       u32,
+    encoder_pct:  Option<u32>,
+}
+
+struct SysSample {
+    ts:                  String,
+    cpu_used_pct:        f64,
+    cpu_free_pct:        f64,
+    memory_total_mb:     f64,
+    memory_used_mb:      f64,
+    memory_free_pct:     f64,
+    swap_total_mb:       f64,
+    swap_used_mb:        f64,
+    swap_used_pct:       f64,
+    network:             Vec<NetRow>,
+    disks:               Vec<DiskRow>,
+    gpus:                Vec<GpuRow>,
 }
 
 // ── App state ─────────────────────────────────────────────────────────────────
@@ -64,25 +99,30 @@ struct MonitorApp {
     log_dir: PathBuf,
     config:  Result<Config, String>,
 
-    /// Enable toggles — map to `monitors.*.enabled` in the config.
-    proc_enabled: bool,
-    sys_enabled:  bool,
-
-    /// Interval values shown in the UI (in seconds, whole numbers).
+    // ── Configuration panel ───────────────────────────────────────────────────
+    proc_enabled:       bool,
+    sys_enabled:        bool,
     proc_poll_secs:     u32,
     proc_snapshot_secs: u32,
     sys_poll_secs:      u32,
-
-    dirty:  bool,
-    status: String,
+    dirty:              bool,
+    status:             String,
 
     // ── Process viewer ────────────────────────────────────────────────────────
-    proc_rows:           Vec<ProcessRow>,
-    proc_last_refresh:   Option<Instant>,
-    proc_source_file:    String,
+    proc_rows:         Vec<ProcessRow>,
+    proc_last_refresh: Option<Instant>,
+    proc_source_file:  String,
+
+    // ── System resource viewer ────────────────────────────────────────────────
+    sys_sample:        Option<SysSample>,
+    sys_last_refresh:  Option<Instant>,
+    sys_source_file:   String,
+
+    /// How often the UI re-reads the log files (seconds). 0 = manual only.
+    ui_refresh_secs: u32,
 }
 
-const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+const DEFAULT_UI_REFRESH_SECS: u32 = 5;
 
 impl MonitorApp {
     fn load(log_dir: PathBuf) -> Self {
@@ -91,7 +131,6 @@ impl MonitorApp {
                 let proc_poll_secs     = (cfg.monitors.process_monitor.resource_poll_interval_ms / 1_000) as u32;
                 let proc_snapshot_secs = (cfg.monitors.process_monitor.snapshot_interval_ms       / 1_000) as u32;
                 let sys_poll_secs      = (cfg.monitors.system_monitor.poll_interval_ms            / 1_000) as u32;
-
                 Self {
                     log_dir,
                     proc_enabled: cfg.monitors.process_monitor.enabled,
@@ -102,16 +141,20 @@ impl MonitorApp {
                     sys_poll_secs,
                     dirty:  false,
                     status: String::new(),
-                    proc_rows:         Vec::new(),
+                    proc_rows:        Vec::new(),
                     proc_last_refresh: None,
                     proc_source_file:  String::new(),
+                    sys_sample:        None,
+                    sys_last_refresh:  None,
+                    sys_source_file:   String::new(),
+                    ui_refresh_secs:   DEFAULT_UI_REFRESH_SECS,
                 }
             }
             Err(e) => Self {
                 log_dir,
                 config: Err(e.to_string()),
-                proc_enabled: true,
-                sys_enabled:  true,
+                proc_enabled:       true,
+                sys_enabled:        true,
                 proc_poll_secs:     5,
                 proc_snapshot_secs: 60,
                 sys_poll_secs:      30,
@@ -120,34 +163,34 @@ impl MonitorApp {
                 proc_rows:         Vec::new(),
                 proc_last_refresh: None,
                 proc_source_file:  String::new(),
+                sys_sample:        None,
+                sys_last_refresh:  None,
+                sys_source_file:   String::new(),
+                ui_refresh_secs:   DEFAULT_UI_REFRESH_SECS,
             },
         };
         app.refresh_processes();
+        app.refresh_system();
         app
     }
 
     fn save(&mut self) {
         let cfg = match &mut self.config {
-            Ok(c) => c,
+            Ok(c)  => c,
             Err(_) => return,
         };
-
-        // Push UI values back into the config (converting seconds → ms).
         cfg.monitors.process_monitor.enabled                    = self.proc_enabled;
         cfg.monitors.process_monitor.resource_poll_interval_ms = self.proc_poll_secs     as u64 * 1_000;
         cfg.monitors.process_monitor.snapshot_interval_ms      = self.proc_snapshot_secs as u64 * 1_000;
         cfg.monitors.system_monitor.enabled                    = self.sys_enabled;
         cfg.monitors.system_monitor.poll_interval_ms           = self.sys_poll_secs      as u64 * 1_000;
 
-        // Serialise and write atomically (temp file → rename).
         let json = match serde_json::to_string_pretty(&cfg) {
             Ok(j)  => j,
             Err(e) => { self.status = format!("Serialise error: {e}"); return; }
         };
-
         let tmp_path    = self.log_dir.join("monitor.config.json.tmp");
         let config_path = self.log_dir.join("monitor.config.json");
-
         if let Err(e) = std::fs::write(&tmp_path, &json) {
             self.status = format!("Write error: {e}");
             return;
@@ -156,47 +199,40 @@ impl MonitorApp {
             self.status = format!("Rename error: {e}");
             return;
         }
-
         self.dirty  = false;
         self.status = "Saved — monitors will pick up the change automatically.".into();
     }
 
-    /// Re-read the latest process-monitor log file and rebuild the process table.
+    /// Rebuild the process table from the latest proc_resources log file.
     fn refresh_processes(&mut self) {
-        let log_file_base = match &self.config {
+        let base = match &self.config {
             Ok(cfg) => cfg.monitors.process_monitor.log_file.clone(),
             Err(_)  => "proc_resources.jsonl".to_string(),
         };
-
-        let log_path = match find_latest_log(&self.log_dir, &log_file_base) {
+        let log_path = match find_latest_log(&self.log_dir, &base) {
             Some(p) => p,
             None => {
-                self.proc_source_file = "no log file found".into();
+                self.proc_source_file  = "no log file found".into();
                 self.proc_last_refresh = Some(Instant::now());
                 return;
             }
         };
-
         let content = match std::fs::read_to_string(&log_path) {
             Ok(c)  => c,
             Err(e) => {
-                self.proc_source_file = format!("read error: {e}");
+                self.proc_source_file  = format!("read error: {e}");
                 self.proc_last_refresh = Some(Instant::now());
                 return;
             }
         };
 
-        // pid → row; rebuilt fresh on every refresh so exited processes fall off
-        // when they are no longer mentioned in any recent resource_sample.
         let mut map: HashMap<u32, ProcessRow> = HashMap::new();
-
         for line in content.lines() {
             let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-
             match v.get("event").and_then(|e| e.as_str()).unwrap_or("") {
                 "process_spawned" => {
-                    let pid       = val_u32(&v, "pid");
-                    let name      = val_str(&v, "name");
+                    let pid = val_u32(&v, "pid");
+                    let name = val_str(&v, "name");
                     let last_seen = ts_time(&v);
                     map.entry(pid).or_insert_with(|| ProcessRow {
                         pid, name, last_seen, alive: true, ..Default::default()
@@ -210,8 +246,6 @@ impl MonitorApp {
                     }
                 }
                 "resource_sample" => {
-                    // Each resource_sample completely overwrites CPU/mem for the
-                    // listed PIDs and marks them alive.
                     let sample_ts = ts_time(&v);
                     if let Some(procs) = v.get("processes").and_then(|p| p.as_array()) {
                         for p in procs {
@@ -233,17 +267,49 @@ impl MonitorApp {
             }
         }
 
-        // Sort: alive first, then alphabetically by name.
         let mut rows: Vec<ProcessRow> = map.into_values().collect();
         rows.sort_by(|a, b| b.alive.cmp(&a.alive).then(a.name.cmp(&b.name)));
-
         self.proc_rows         = rows;
         self.proc_last_refresh = Some(Instant::now());
-        self.proc_source_file  = log_path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned();
+        self.proc_source_file  = log_path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+    }
+
+    /// Read the latest system_resource_sample from the sys_resources log file.
+    fn refresh_system(&mut self) {
+        let base = match &self.config {
+            Ok(cfg) => cfg.monitors.system_monitor.log_file.clone(),
+            Err(_)  => "sys_resources.jsonl".to_string(),
+        };
+        let log_path = match find_latest_log(&self.log_dir, &base) {
+            Some(p) => p,
+            None => {
+                self.sys_source_file  = "no log file found".into();
+                self.sys_last_refresh = Some(Instant::now());
+                return;
+            }
+        };
+        let content = match std::fs::read_to_string(&log_path) {
+            Ok(c)  => c,
+            Err(e) => {
+                self.sys_source_file  = format!("read error: {e}");
+                self.sys_last_refresh = Some(Instant::now());
+                return;
+            }
+        };
+
+        // Walk all lines; keep the last system_resource_sample.
+        let mut last: Option<serde_json::Value> = None;
+        for line in content.lines() {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                if v.get("event").and_then(|e| e.as_str()) == Some("system_resource_sample") {
+                    last = Some(v);
+                }
+            }
+        }
+
+        self.sys_sample = last.as_ref().map(parse_sys_sample);
+        self.sys_last_refresh = Some(Instant::now());
+        self.sys_source_file  = log_path.file_name().unwrap_or_default().to_string_lossy().into_owned();
     }
 }
 
@@ -251,221 +317,333 @@ impl MonitorApp {
 
 impl eframe::App for MonitorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Auto-refresh the process table every REFRESH_INTERVAL.
-        let due = self.proc_last_refresh
-            .map_or(true, |t| t.elapsed() >= REFRESH_INTERVAL);
-        if due {
-            self.refresh_processes();
+        // Auto-refresh both viewers when the interval is active (> 0).
+        if self.ui_refresh_secs > 0 {
+            let interval = Duration::from_secs(self.ui_refresh_secs as u64);
+            let proc_due = self.proc_last_refresh.map_or(true, |t| t.elapsed() >= interval);
+            let sys_due  = self.sys_last_refresh .map_or(true, |t| t.elapsed() >= interval);
+            if proc_due { self.refresh_processes(); }
+            if sys_due  { self.refresh_system(); }
+            ctx.request_repaint_after(interval);
         }
-        ctx.request_repaint_after(REFRESH_INTERVAL);
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Monitor Configuration");
-            ui.label(
-                egui::RichText::new(self.log_dir.display().to_string())
-                    .small()
-                    .color(egui::Color32::GRAY),
-            );
-
-            ui.add_space(12.0);
-
-            // ── Error state ───────────────────────────────────────────────────
-            if let Err(ref msg) = self.config {
-                ui.colored_label(egui::Color32::RED, format!("Cannot load config: {msg}"));
-                return;
-            }
-
-            // ── Process Monitor ───────────────────────────────────────────────
-            ui.group(|ui| {
-                ui.set_width(ui.available_width());
-
-                ui.horizontal(|ui| {
-                    let before = self.proc_enabled;
-                    ui.checkbox(&mut self.proc_enabled, egui::RichText::new("Process Monitor").strong());
-                    if self.proc_enabled != before { self.dirty = true; self.status.clear(); }
-                    if !self.proc_enabled {
-                        ui.colored_label(egui::Color32::YELLOW, "  disabled — monitor will not start");
-                    }
-                });
-                ui.separator();
-
-                ui.add_enabled_ui(self.proc_enabled, |ui| {
-                    egui::Grid::new("proc_grid")
-                        .num_columns(3)
-                        .spacing([12.0, 8.0])
-                        .show(ui, |ui| {
-
-                        ui.label("Resource poll interval");
-                        let before = self.proc_poll_secs;
-                        ui.add(
-                            egui::Slider::new(&mut self.proc_poll_secs, 0..=60)
-                                .suffix(" s")
-                                .clamping(egui::SliderClamping::Always),
-                        );
-                        ui.label(interval_hint(self.proc_poll_secs));
-                        if self.proc_poll_secs != before { self.dirty = true; self.status.clear(); }
-                        ui.end_row();
-
-                        ui.label("Snapshot interval");
-                        let before = self.proc_snapshot_secs;
-                        ui.add(
-                            egui::Slider::new(&mut self.proc_snapshot_secs, 0..=600)
-                                .suffix(" s")
-                                .clamping(egui::SliderClamping::Always),
-                        );
-                        ui.label(interval_hint(self.proc_snapshot_secs));
-                        if self.proc_snapshot_secs != before { self.dirty = true; self.status.clear(); }
-                        ui.end_row();
-                    });
-                });
-            });
-
-            ui.add_space(10.0);
-
-            // ── System Monitor ────────────────────────────────────────────────
-            ui.group(|ui| {
-                ui.set_width(ui.available_width());
-
-                ui.horizontal(|ui| {
-                    let before = self.sys_enabled;
-                    ui.checkbox(&mut self.sys_enabled, egui::RichText::new("System Monitor").strong());
-                    if self.sys_enabled != before { self.dirty = true; self.status.clear(); }
-                    if !self.sys_enabled {
-                        ui.colored_label(egui::Color32::YELLOW, "  disabled — monitor will not start");
-                    }
-                });
-                ui.separator();
-
-                ui.add_enabled_ui(self.sys_enabled, |ui| {
-                    egui::Grid::new("sys_grid")
-                        .num_columns(3)
-                        .spacing([12.0, 8.0])
-                        .show(ui, |ui| {
-
-                        ui.label("Poll interval");
-                        let before = self.sys_poll_secs;
-                        ui.add(
-                            egui::Slider::new(&mut self.sys_poll_secs, 0..=300)
-                                .suffix(" s")
-                                .clamping(egui::SliderClamping::Always),
-                        );
-                        ui.label(interval_hint(self.sys_poll_secs));
-                        if self.sys_poll_secs != before { self.dirty = true; self.status.clear(); }
-                        ui.end_row();
-                    });
-                });
-            });
-
-            ui.add_space(16.0);
-
-            // ── Save button + status ──────────────────────────────────────────
-            ui.horizontal(|ui| {
-                let save_btn = ui.add_enabled(
-                    self.dirty,
-                    egui::Button::new("💾  Save"),
-                );
-                if save_btn.clicked() {
-                    self.save();
-                }
-
-                if self.dirty {
-                    ui.colored_label(egui::Color32::YELLOW, "  Unsaved changes");
-                } else if !self.status.is_empty() {
-                    ui.colored_label(egui::Color32::GREEN, format!("  ✓  {}", self.status));
-                }
-            });
-
-            ui.add_space(16.0);
-            ui.separator();
-            ui.add_space(8.0);
-
-            // ── Process viewer ────────────────────────────────────────────────
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Watched Processes").strong());
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("⟳  Refresh").clicked() {
-                        self.refresh_processes();
-                    }
-                    if !self.proc_source_file.is_empty() {
-                        ui.label(
-                            egui::RichText::new(&self.proc_source_file)
-                                .small()
-                                .color(egui::Color32::GRAY),
-                        );
-                    }
-                });
-            });
-
-            ui.add_space(4.0);
-
-            if self.proc_rows.is_empty() {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.heading("Monitor Configuration");
                 ui.label(
-                    egui::RichText::new("No processes found — is process-monitor running?")
+                    egui::RichText::new(self.log_dir.display().to_string())
+                        .small()
                         .color(egui::Color32::GRAY),
                 );
-            } else {
-                // Column header
-                egui::Grid::new("proc_header")
-                    .num_columns(7)
-                    .spacing([12.0, 2.0])
-                    .striped(false)
-                    .show(ui, |ui| {
-                        for label in ["Name", "PID", "CPU %", "Mem MB", "Handles", "Threads", "Last seen"] {
-                            ui.label(egui::RichText::new(label).strong().small());
+                ui.add_space(12.0);
+
+                if let Err(ref msg) = self.config {
+                    ui.colored_label(egui::Color32::RED, format!("Cannot load config: {msg}"));
+                    return;
+                }
+
+                // ── Process Monitor config ─────────────────────────────────────
+                ui.group(|ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        let before = self.proc_enabled;
+                        ui.checkbox(&mut self.proc_enabled, egui::RichText::new("Process Monitor").strong());
+                        if self.proc_enabled != before { self.dirty = true; self.status.clear(); }
+                        if !self.proc_enabled {
+                            ui.colored_label(egui::Color32::YELLOW, "  disabled — monitor will not start");
                         }
-                        ui.end_row();
+                    });
+                    ui.separator();
+                    ui.add_enabled_ui(self.proc_enabled, |ui| {
+                        egui::Grid::new("proc_grid")
+                            .num_columns(3)
+                            .spacing([12.0, 8.0])
+                            .show(ui, |ui| {
+                            ui.label("Resource poll interval");
+                            let before = self.proc_poll_secs;
+                            ui.add(egui::Slider::new(&mut self.proc_poll_secs, 0..=60)
+                                .suffix(" s").clamping(egui::SliderClamping::Always));
+                            ui.label(interval_hint(self.proc_poll_secs));
+                            if self.proc_poll_secs != before { self.dirty = true; self.status.clear(); }
+                            ui.end_row();
+
+                            ui.label("Snapshot interval");
+                            let before = self.proc_snapshot_secs;
+                            ui.add(egui::Slider::new(&mut self.proc_snapshot_secs, 0..=600)
+                                .suffix(" s").clamping(egui::SliderClamping::Always));
+                            ui.label(interval_hint(self.proc_snapshot_secs));
+                            if self.proc_snapshot_secs != before { self.dirty = true; self.status.clear(); }
+                            ui.end_row();
+                        });
+                    });
+                });
+
+                ui.add_space(10.0);
+
+                // ── System Monitor config ──────────────────────────────────────
+                ui.group(|ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        let before = self.sys_enabled;
+                        ui.checkbox(&mut self.sys_enabled, egui::RichText::new("System Monitor").strong());
+                        if self.sys_enabled != before { self.dirty = true; self.status.clear(); }
+                        if !self.sys_enabled {
+                            ui.colored_label(egui::Color32::YELLOW, "  disabled — monitor will not start");
+                        }
+                    });
+                    ui.separator();
+                    ui.add_enabled_ui(self.sys_enabled, |ui| {
+                        egui::Grid::new("sys_grid")
+                            .num_columns(3)
+                            .spacing([12.0, 8.0])
+                            .show(ui, |ui| {
+                            ui.label("Poll interval");
+                            let before = self.sys_poll_secs;
+                            ui.add(egui::Slider::new(&mut self.sys_poll_secs, 0..=300)
+                                .suffix(" s").clamping(egui::SliderClamping::Always));
+                            ui.label(interval_hint(self.sys_poll_secs));
+                            if self.sys_poll_secs != before { self.dirty = true; self.status.clear(); }
+                            ui.end_row();
+                        });
+                    });
+                });
+
+                ui.add_space(16.0);
+
+                // ── Save button ────────────────────────────────────────────────
+                ui.horizontal(|ui| {
+                    let save_btn = ui.add_enabled(self.dirty, egui::Button::new("💾  Save"));
+                    if save_btn.clicked() { self.save(); }
+                    if self.dirty {
+                        ui.colored_label(egui::Color32::YELLOW, "  Unsaved changes");
+                    } else if !self.status.is_empty() {
+                        ui.colored_label(egui::Color32::GREEN, format!("  ✓  {}", self.status));
+                    }
+                });
+
+                // ── UI refresh interval ────────────────────────────────────────
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.label("UI auto-refresh");
+                    ui.add(egui::Slider::new(&mut self.ui_refresh_secs, 0..=60)
+                        .suffix(" s")
+                        .clamping(egui::SliderClamping::Always));
+                    ui.label(egui::RichText::new(
+                        if self.ui_refresh_secs == 0 { "manual only" } else { "interval" }
+                    ).color(egui::Color32::GRAY).small());
+                });
+
+                // ── Watched Processes viewer ───────────────────────────────────
+                ui.add_space(16.0);
+                ui.separator();
+                ui.add_space(8.0);
+
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Watched Processes").strong());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("⟳  Refresh").clicked() {
+                            self.refresh_processes();
+                        }
+                        if !self.proc_source_file.is_empty() {
+                            ui.label(egui::RichText::new(&self.proc_source_file)
+                                .small().color(egui::Color32::GRAY));
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+
+                if self.proc_rows.is_empty() {
+                    ui.label(egui::RichText::new("No processes found — is process-monitor running?")
+                        .color(egui::Color32::GRAY));
+                } else {
+                    egui::Grid::new("proc_header")
+                        .num_columns(7).spacing([12.0, 2.0])
+                        .show(ui, |ui| {
+                            for label in ["Name", "PID", "CPU %", "Mem MB", "Handles", "Threads", "Last seen"] {
+                                ui.label(egui::RichText::new(label).strong().small());
+                            }
+                            ui.end_row();
+                        });
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .id_salt("proc_scroll")
+                        .max_height(180.0)
+                        .show(ui, |ui| {
+                            egui::Grid::new("proc_table")
+                                .num_columns(7).spacing([12.0, 4.0]).striped(true)
+                                .show(ui, |ui| {
+                                    for row in &self.proc_rows {
+                                        let color = if row.alive { egui::Color32::WHITE } else { egui::Color32::GRAY };
+                                        ui.label(egui::RichText::new(&row.name).color(color));
+                                        ui.label(egui::RichText::new(row.pid.to_string()).color(color));
+                                        if row.alive {
+                                            ui.label(format!("{:.1}", row.cpu_percent));
+                                            ui.label(format!("{:.1}", row.memory_mb));
+                                            ui.label(row.handles.to_string());
+                                            ui.label(row.threads.to_string());
+                                        } else {
+                                            for _ in 0..4 {
+                                                ui.label(egui::RichText::new("—").color(egui::Color32::GRAY));
+                                            }
+                                        }
+                                        ui.label(egui::RichText::new(&row.last_seen)
+                                            .small().color(egui::Color32::GRAY));
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                }
+
+                // ── System Resources viewer ────────────────────────────────────
+                ui.add_space(16.0);
+                ui.separator();
+                ui.add_space(8.0);
+
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("System Resources").strong());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("⟳  Refresh").clicked() {
+                            self.refresh_system();
+                        }
+                        if !self.sys_source_file.is_empty() {
+                            ui.label(egui::RichText::new(&self.sys_source_file)
+                                .small().color(egui::Color32::GRAY));
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+
+                if self.sys_sample.is_none() {
+                    ui.label(egui::RichText::new("No data — is system-monitor running?")
+                        .color(egui::Color32::GRAY));
+                } else {
+                    // Unwrap is safe: we just checked is_none above.
+                    let s = self.sys_sample.as_ref().unwrap();
+
+                    ui.label(egui::RichText::new(format!("Last sample:  {}", s.ts))
+                        .small().color(egui::Color32::GRAY));
+                    ui.add_space(6.0);
+
+                    // CPU
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("CPU ").strong().monospace());
+                        ui.add(egui::ProgressBar::new(s.cpu_used_pct as f32 / 100.0)
+                            .desired_width(220.0)
+                            .fill(threshold_color(s.cpu_used_pct, 70.0, 90.0, Dir::Above))
+                            .text(format!("{:.1}% used", s.cpu_used_pct)));
+                        ui.label(egui::RichText::new(format!("{:.1}% free", s.cpu_free_pct))
+                            .color(threshold_color(s.cpu_free_pct, 30.0, 10.0, Dir::Below)));
                     });
 
-                ui.separator();
+                    // RAM
+                    let mem_used_frac = (s.memory_used_mb / s.memory_total_mb.max(1.0)) as f32;
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("RAM ").strong().monospace());
+                        ui.add(egui::ProgressBar::new(mem_used_frac)
+                            .desired_width(220.0)
+                            .fill(threshold_color(s.memory_free_pct, 30.0, 15.0, Dir::Below))
+                            .text(format!("{:.0} / {:.0} MB", s.memory_used_mb, s.memory_total_mb)));
+                        ui.label(egui::RichText::new(format!("{:.1}% free", s.memory_free_pct))
+                            .color(threshold_color(s.memory_free_pct, 30.0, 15.0, Dir::Below)));
+                    });
 
-                egui::ScrollArea::vertical()
-                    .max_height(220.0)
-                    .show(ui, |ui| {
-                        egui::Grid::new("proc_table")
-                            .num_columns(7)
-                            .spacing([12.0, 4.0])
-                            .striped(true)
+                    // Swap
+                    if s.swap_total_mb > 0.0 {
+                        let swap_frac = (s.swap_used_mb / s.swap_total_mb.max(1.0)) as f32;
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Swap").strong().monospace());
+                            ui.add(egui::ProgressBar::new(swap_frac)
+                                .desired_width(220.0)
+                                .fill(threshold_color(s.swap_used_pct, 30.0, 70.0, Dir::Above))
+                                .text(format!("{:.0} / {:.0} MB", s.swap_used_mb, s.swap_total_mb)));
+                            ui.label(egui::RichText::new(format!("{:.1}% used", s.swap_used_pct))
+                                .color(threshold_color(s.swap_used_pct, 30.0, 70.0, Dir::Above)));
+                        });
+                    }
+
+                    // Network
+                    if !s.network.is_empty() {
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new("Network").strong());
+                        egui::Grid::new("net_grid")
+                            .num_columns(4).spacing([16.0, 3.0]).striped(true)
                             .show(ui, |ui| {
-                                for row in &self.proc_rows {
-                                    let color = if row.alive {
-                                        egui::Color32::WHITE
+                                for n in &s.network {
+                                    ui.label(&n.interface);
+                                    ui.label(format!("↓ {:.2} MB/s", n.rx));
+                                    ui.label(format!("↑ {:.2} MB/s", n.tx));
+                                    if n.errors > 0 {
+                                        ui.label(egui::RichText::new(format!("{} errors", n.errors))
+                                            .color(egui::Color32::RED));
                                     } else {
-                                        egui::Color32::GRAY
-                                    };
-                                    ui.label(egui::RichText::new(&row.name).color(color));
-                                    ui.label(egui::RichText::new(row.pid.to_string()).color(color));
-                                    if row.alive {
-                                        ui.label(format!("{:.1}", row.cpu_percent));
-                                        ui.label(format!("{:.1}", row.memory_mb));
-                                        ui.label(row.handles.to_string());
-                                        ui.label(row.threads.to_string());
-                                    } else {
-                                        for _ in 0..4 {
-                                            ui.label(egui::RichText::new("—").color(egui::Color32::GRAY));
-                                        }
+                                        ui.label(egui::RichText::new("no errors")
+                                            .color(egui::Color32::GRAY));
                                     }
-                                    ui.label(
-                                        egui::RichText::new(&row.last_seen)
-                                            .small()
-                                            .color(egui::Color32::GRAY),
-                                    );
                                     ui.end_row();
                                 }
                             });
-                    });
-            }
-        });
+                    }
+
+                    // Disks
+                    if !s.disks.is_empty() {
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new("Disks").strong());
+                        egui::Grid::new("disk_grid")
+                            .num_columns(4).spacing([16.0, 3.0]).striped(true)
+                            .show(ui, |ui| {
+                                for d in &s.disks {
+                                    let used_frac = 1.0 - (d.free_pct as f32 / 100.0);
+                                    ui.label(&d.path);
+                                    ui.add(egui::ProgressBar::new(used_frac)
+                                        .desired_width(140.0)
+                                        .fill(threshold_color(d.free_gb, 20.0, 10.0, Dir::Below))
+                                        .text(format!("{:.1} GB free", d.free_gb)));
+                                    ui.label(format!("/ {:.1} GB", d.total_gb));
+                                    ui.label(egui::RichText::new(format!("{:.1}% free", d.free_pct))
+                                        .color(threshold_color(d.free_gb, 20.0, 10.0, Dir::Below)));
+                                    ui.end_row();
+                                }
+                            });
+                    }
+
+                    // GPUs
+                    if !s.gpus.is_empty() {
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new("GPU").strong());
+                        egui::Grid::new("gpu_grid")
+                            .num_columns(5).spacing([16.0, 3.0]).striped(true)
+                            .show(ui, |ui| {
+                                for g in &s.gpus {
+                                    ui.label(&g.name);
+                                    ui.label(egui::RichText::new(format!("{:.0}% util", g.util_pct))
+                                        .color(threshold_color(g.util_pct, 80.0, 95.0, Dir::Above)));
+                                    ui.label(egui::RichText::new(format!("{:.0} MB VRAM free", g.vram_free_mb))
+                                        .color(threshold_color(g.vram_free_mb, 500.0, 200.0, Dir::Below)));
+                                    ui.label(egui::RichText::new(format!("{}°C", g.temp_c))
+                                        .color(threshold_color(g.temp_c as f64, 80.0, 90.0, Dir::Above)));
+                                    if let Some(enc) = g.encoder_pct {
+                                        ui.label(egui::RichText::new(format!("Enc {}%", enc))
+                                            .color(threshold_color(enc as f64, 80.0, 95.0, Dir::Above)));
+                                    } else {
+                                        ui.label("");
+                                    }
+                                    ui.end_row();
+                                }
+                            });
+                    }
+                }
+            }); // ScrollArea
+        }); // CentralPanel
     }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Find the highest-numbered rotation of `base_name` (e.g. `proc_resources.jsonl`)
-/// in `log_dir`.  Files are named `<stem>.<n>.jsonl`.
+/// Find the highest-numbered rotation of `base_name` in `log_dir`.
+/// Files are named `<stem>.<n>.jsonl`.
 fn find_latest_log(log_dir: &Path, base_name: &str) -> Option<PathBuf> {
     let stem = base_name.trim_end_matches(".jsonl");
     let mut best: Option<(u32, PathBuf)> = None;
-
     let entries = std::fs::read_dir(log_dir).ok()?;
     for entry in entries.flatten() {
         let fname = entry.file_name();
@@ -483,17 +661,72 @@ fn find_latest_log(log_dir: &Path, base_name: &str) -> Option<PathBuf> {
     best.map(|(_, p)| p)
 }
 
+fn parse_sys_sample(v: &serde_json::Value) -> SysSample {
+    let network = v.get("network").and_then(|n| n.as_array())
+        .map(|arr| arr.iter().map(|n| NetRow {
+            interface: val_str(n, "interface"),
+            rx:        n.get("rx_mb_per_sec").and_then(|x| x.as_f64()).unwrap_or(0.0),
+            tx:        n.get("tx_mb_per_sec").and_then(|x| x.as_f64()).unwrap_or(0.0),
+            errors:    n.get("rx_errors").and_then(|x| x.as_u64()).unwrap_or(0)
+                     + n.get("tx_errors").and_then(|x| x.as_u64()).unwrap_or(0),
+        }).collect())
+        .unwrap_or_default();
+
+    let disks = v.get("disks").and_then(|d| d.as_array())
+        .map(|arr| arr.iter().map(|d| DiskRow {
+            path:     val_str(d, "path"),
+            total_gb: d.get("total_gb")     .and_then(|x| x.as_f64()).unwrap_or(0.0),
+            free_gb:  d.get("free_gb")      .and_then(|x| x.as_f64()).unwrap_or(0.0),
+            free_pct: d.get("free_percent") .and_then(|x| x.as_f64()).unwrap_or(0.0),
+        }).collect())
+        .unwrap_or_default();
+
+    let gpus = v.get("gpus").and_then(|g| g.as_array())
+        .map(|arr| arr.iter().map(|g| GpuRow {
+            name:         val_str(g, "name"),
+            util_pct:     g.get("gpu_used_percent").and_then(|x| x.as_f64()).unwrap_or(0.0),
+            vram_free_mb: g.get("vram_free_mb")    .and_then(|x| x.as_f64()).unwrap_or(0.0),
+            temp_c:       g.get("temperature_c")   .and_then(|x| x.as_u64()).unwrap_or(0) as u32,
+            encoder_pct:  g.get("encoder_percent") .and_then(|x| x.as_u64()).map(|x| x as u32),
+        }).collect())
+        .unwrap_or_default();
+
+    SysSample {
+        ts:              ts_time(v),
+        cpu_used_pct:    v.get("cpu_used_percent")   .and_then(|x| x.as_f64()).unwrap_or(0.0),
+        cpu_free_pct:    v.get("cpu_free_percent")   .and_then(|x| x.as_f64()).unwrap_or(0.0),
+        memory_total_mb: v.get("memory_total_mb")    .and_then(|x| x.as_f64()).unwrap_or(0.0),
+        memory_used_mb:  v.get("memory_used_mb")     .and_then(|x| x.as_f64()).unwrap_or(0.0),
+        memory_free_pct: v.get("memory_free_percent").and_then(|x| x.as_f64()).unwrap_or(0.0),
+        swap_total_mb:   v.get("swap_total_mb")      .and_then(|x| x.as_f64()).unwrap_or(0.0),
+        swap_used_mb:    v.get("swap_used_mb")       .and_then(|x| x.as_f64()).unwrap_or(0.0),
+        swap_used_pct:   v.get("swap_used_percent")  .and_then(|x| x.as_f64()).unwrap_or(0.0),
+        network,
+        disks,
+        gpus,
+    }
+}
+
+/// Direction for threshold comparison.
+enum Dir { Above, Below }
+
+/// Green / yellow / red based on warn and alert thresholds.
+fn threshold_color(value: f64, warn: f64, alert: f64, dir: Dir) -> egui::Color32 {
+    let (warn_hit, alert_hit) = match dir {
+        Dir::Above => (value >= warn,  value >= alert),
+        Dir::Below => (value <= warn,  value <= alert),
+    };
+    if alert_hit      { egui::Color32::from_rgb(210, 60,  60)  }
+    else if warn_hit  { egui::Color32::from_rgb(210, 160, 40)  }
+    else              { egui::Color32::from_rgb(80,  180, 80)  }
+}
+
 /// Extract `HH:MM:SS` from a `ts` field like `"2026-03-23T10:00:00.000Z"`.
 fn ts_time(v: &serde_json::Value) -> String {
     let ts = v.get("ts").and_then(|x| x.as_str()).unwrap_or("");
-    // ts format: 2026-03-23T10:00:00.000Z  →  split on T, take time, drop millis
-    ts.splitn(2, 'T')
-        .nth(1)
-        .unwrap_or("")
-        .splitn(2, '.')
-        .next()
-        .unwrap_or("")
-        .to_string()
+    ts.splitn(2, 'T').nth(1).unwrap_or("")
+      .splitn(2, '.').next().unwrap_or("")
+      .to_string()
 }
 
 fn val_u32(v: &serde_json::Value, key: &str) -> u32 {
