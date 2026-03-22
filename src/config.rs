@@ -129,8 +129,9 @@ pub struct SystemMonitorConfig {
     #[serde(default = "default_sys_log_file")]
     pub log_file: String,
 
-    /// How often to sample system-wide CPU, RAM and disk (milliseconds).
-    /// Default 30 s — system resources change slowly.
+    /// How often to sample system-wide resources (milliseconds).
+    /// Default 30 s — system resources change slowly and streaming servers
+    /// need stable averages, not noisy second-by-second snapshots.
     #[serde(default = "default_sys_poll_ms")]
     pub poll_interval_ms: u64,
 
@@ -139,6 +140,11 @@ pub struct SystemMonitorConfig {
     #[serde(default)]
     pub watch_disks: Vec<String>,
 
+    /// Network interface names to include (e.g. `["Ethernet", "Wi-Fi"]`).
+    /// An empty list means *all* non-loopback interfaces are reported.
+    #[serde(default)]
+    pub watch_network_interfaces: Vec<String>,
+
     #[serde(default)]
     pub log: SystemMonitorLogConfig,
 }
@@ -146,44 +152,128 @@ pub struct SystemMonitorConfig {
 impl Default for SystemMonitorConfig {
     fn default() -> Self {
         Self {
-            enabled:          true,
-            log_file:         default_sys_log_file(),
-            poll_interval_ms: default_sys_poll_ms(),
-            watch_disks:      Vec::new(),
-            log:              SystemMonitorLogConfig::default(),
+            enabled:                  true,
+            log_file:                 default_sys_log_file(),
+            poll_interval_ms:         default_sys_poll_ms(),
+            watch_disks:              Vec::new(),
+            watch_network_interfaces: Vec::new(),
+            log:                      SystemMonitorLogConfig::default(),
         }
     }
 }
 
+/// Fine-grained control over what system-monitor logs and when it alerts.
+///
+/// Two-tier alerting:
+/// - `*_warn_*`  → logged at **WARN** level (approaching a limit)
+/// - `*_alert_*` → logged at **ERROR** level (limit breached, action needed)
 #[derive(Debug, Clone, Deserialize)]
 pub struct SystemMonitorLogConfig {
-    #[serde(default = "yes")] pub cpu:    bool,
-    #[serde(default = "yes")] pub memory: bool,
-    #[serde(default = "yes")] pub disk:   bool,
+    // ── Toggle groups ─────────────────────────────────────────────────────────
+    #[serde(default = "yes")] pub cpu:         bool,
+    /// Log individual core usage and frequency (useful for ffmpeg bottleneck detection).
+    #[serde(default = "yes")] pub cpu_per_core: bool,
+    #[serde(default = "yes")] pub memory:      bool,
+    /// Log swap / pagefile usage.  High swap = stream stutter.
+    #[serde(default = "yes")] pub swap:        bool,
+    #[serde(default = "yes")] pub disk:        bool,
+    /// Log per-interface network throughput and errors.
+    #[serde(default = "yes")] pub network:     bool,
 
-    /// Emit a `cpu_headroom_alert` when free CPU headroom falls below this %.
-    #[serde(default)]
-    pub cpu_alert_free_percent: Option<f64>,
+    // ── CPU thresholds (system-wide free headroom) ────────────────────────────
+    /// WARN when free CPU headroom falls below this %.
+    #[serde(default)] pub cpu_warn_free_percent:  Option<f64>,
+    /// ERROR when free CPU headroom falls below this %.
+    #[serde(default)] pub cpu_alert_free_percent: Option<f64>,
 
-    /// Emit a `memory_headroom_alert` when available RAM falls below this MB.
-    #[serde(default)]
-    pub memory_alert_free_mb: Option<f64>,
+    // ── CPU per-core thresholds ───────────────────────────────────────────────
+    /// WARN when any single core exceeds this % (ffmpeg single-core bottleneck).
+    #[serde(default)] pub cpu_core_warn_percent:  Option<f64>,
+    /// ERROR when any single core exceeds this %.
+    #[serde(default)] pub cpu_core_alert_percent: Option<f64>,
 
-    /// Emit a `disk_headroom_alert` when free space on any watched disk falls
-    /// below this GB.
-    #[serde(default)]
-    pub disk_alert_free_gb: Option<f64>,
+    // ── Memory thresholds (available RAM) ─────────────────────────────────────
+    /// WARN when available RAM falls below this MB.
+    #[serde(default)] pub memory_warn_free_mb:  Option<f64>,
+    /// ERROR when available RAM falls below this MB.
+    #[serde(default)] pub memory_alert_free_mb: Option<f64>,
+
+    // ── Swap / pagefile thresholds ────────────────────────────────────────────
+    /// WARN when swap used % exceeds this value.
+    #[serde(default)] pub swap_warn_used_percent:  Option<f64>,
+    /// ERROR when swap used % exceeds this value.
+    #[serde(default)] pub swap_alert_used_percent: Option<f64>,
+
+    // ── Disk thresholds ───────────────────────────────────────────────────────
+    /// WARN when free space on any watched disk falls below this GB.
+    #[serde(default)] pub disk_warn_free_gb:  Option<f64>,
+    /// ERROR when free space on any watched disk falls below this GB.
+    #[serde(default)] pub disk_alert_free_gb: Option<f64>,
+
+    // ── Network thresholds ────────────────────────────────────────────────────
+    /// Emit a WARN when receive throughput exceeds this value (MB/s) on any interface.
+    #[serde(default)] pub network_rx_warn_mbps: Option<f64>,
+    /// Emit a WARN when transmit throughput exceeds this value (MB/s) on any interface.
+    #[serde(default)] pub network_tx_warn_mbps: Option<f64>,
+    /// Emit an ERROR alert when any interface has receive or transmit errors.
+    #[serde(default = "yes")] pub network_error_alert: bool,
+
+    // ── GPU thresholds (NVIDIA NVML only) ─────────────────────────────────────
+    /// Log GPU metrics (requires `nvidia` feature flag at build time).
+    #[serde(default = "yes")] pub gpu: bool,
+    /// WARN when GPU overall utilisation exceeds this %.
+    #[serde(default)] pub gpu_warn_util_percent:  Option<f64>,
+    /// ERROR when GPU overall utilisation exceeds this %.
+    #[serde(default)] pub gpu_alert_util_percent: Option<f64>,
+    /// WARN when NVENC encoder utilisation exceeds this %.
+    #[serde(default)] pub gpu_encoder_warn_percent: Option<f64>,
+    /// WARN when available VRAM drops below this MB.
+    #[serde(default)] pub gpu_vram_warn_free_mb:  Option<f64>,
+    /// ERROR when available VRAM drops below this MB.
+    #[serde(default)] pub gpu_vram_alert_free_mb: Option<f64>,
+    /// WARN when GPU temperature exceeds this °C.
+    #[serde(default)] pub gpu_temp_warn_c:  Option<f64>,
+    /// ERROR when GPU temperature exceeds this °C.
+    #[serde(default)] pub gpu_temp_alert_c: Option<f64>,
 }
 
 impl Default for SystemMonitorLogConfig {
     fn default() -> Self {
         Self {
-            cpu:                    true,
-            memory:                 true,
-            disk:                   true,
-            cpu_alert_free_percent: None,
-            memory_alert_free_mb:   None,
-            disk_alert_free_gb:     None,
+            cpu:          true,
+            cpu_per_core: true,
+            memory:       true,
+            swap:         true,
+            disk:         true,
+            network:      true,
+
+            cpu_warn_free_percent:  Some(30.0),
+            cpu_alert_free_percent: Some(10.0),
+
+            cpu_core_warn_percent:  Some(85.0),
+            cpu_core_alert_percent: Some(95.0),
+
+            memory_warn_free_mb:  Some(1000.0),
+            memory_alert_free_mb: Some(500.0),
+
+            swap_warn_used_percent:  Some(30.0),
+            swap_alert_used_percent: Some(70.0),
+
+            disk_warn_free_gb:  Some(20.0),
+            disk_alert_free_gb: Some(10.0),
+
+            network_rx_warn_mbps:  None,
+            network_tx_warn_mbps:  None,
+            network_error_alert:   true,
+
+            gpu:                      true,
+            gpu_warn_util_percent:    Some(80.0),
+            gpu_alert_util_percent:   Some(95.0),
+            gpu_encoder_warn_percent: Some(80.0),
+            gpu_vram_warn_free_mb:    Some(500.0),
+            gpu_vram_alert_free_mb:   Some(200.0),
+            gpu_temp_warn_c:          Some(80.0),
+            gpu_temp_alert_c:         Some(90.0),
         }
     }
 }

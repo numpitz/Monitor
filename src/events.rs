@@ -28,12 +28,6 @@ pub enum Level {
 }
 
 // ── Wrapper that every log entry uses ────────────────────────────────────────
-//
-// Produces JSON like:
-//   {"ts":"...","monitor":"process_monitor","event":"resource_sample",
-//    "level":"INFO","processes":[...]}
-//
-// The `data` struct is flattened so its fields appear at the root level.
 
 #[derive(Serialize)]
 pub struct LogEntry<'a, T: Serialize> {
@@ -65,9 +59,7 @@ impl<'a, T: Serialize> LogEntry<'a, T> {
 pub struct MonitorStartData {
     pub pid:      u32,
     pub log_file: String,
-    /// true when this entry was caused by log rotation (not initial startup)
     pub rotation: bool,
-    /// name of the previous log file (only present when rotation == true)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub continued_from: Option<String>,
 }
@@ -117,8 +109,8 @@ pub struct ProcessExitedData {
 pub struct ProcessSample {
     pub pid:         u32,
     pub name:        String,
-    pub cpu_percent: f64,   // % of one logical CPU core
-    pub memory_mb:   f64,   // working set in MB
+    pub cpu_percent: f64,
+    pub memory_mb:   f64,
     pub handles:     u32,
     pub threads:     u32,
 }
@@ -152,8 +144,50 @@ pub struct TreeSnapshotData {
 
 // ── system-monitor event data ─────────────────────────────────────────────────
 
-/// One drive entry inside a `system_resource_sample` event.
+/// Written once at startup — gives static context to every subsequent sample.
 #[derive(Serialize)]
+pub struct SystemInfoData {
+    /// e.g. "Intel(R) Core(TM) i7-12700K CPU @ 3.60GHz"
+    pub cpu_brand:       String,
+    pub cpu_arch:        String,
+    pub cpu_core_count:  usize,
+    pub memory_total_mb: f64,
+    pub swap_total_mb:   f64,
+    pub os_name:         String,
+    pub os_version:      String,
+    pub hostname:        String,
+    /// Detected GPU devices (name only — real-time metrics are in `system_resource_sample`).
+    pub gpus:            Vec<String>,
+    /// "nvml" if NVIDIA GPU monitoring is active, "none" otherwise.
+    pub gpu_monitoring:  String,
+}
+
+/// Usage of one logical CPU core.
+#[derive(Serialize, Clone)]
+pub struct CoreSample {
+    /// Zero-based core index.
+    pub id:            usize,
+    pub used_percent:  f64,
+    /// Current clock speed in MHz (0 if unavailable).
+    pub frequency_mhz: u64,
+}
+
+/// One network interface entry inside a `system_resource_sample` event.
+#[derive(Serialize, Clone)]
+pub struct NetworkSample {
+    pub interface:        String,
+    /// Megabytes received since the previous poll.
+    pub rx_mb_per_sec:    f64,
+    /// Megabytes transmitted since the previous poll.
+    pub tx_mb_per_sec:    f64,
+    /// Cumulative receive errors on this interface.
+    pub rx_errors:        u64,
+    /// Cumulative transmit errors on this interface.
+    pub tx_errors:        u64,
+}
+
+/// One drive entry inside a `system_resource_sample` event.
+#[derive(Serialize, Clone)]
 pub struct DiskSample {
     pub path:         String,
     pub total_gb:     f64,
@@ -162,17 +196,73 @@ pub struct DiskSample {
     pub free_percent: f64,
 }
 
+/// One GPU entry inside a `system_resource_sample` event.
+///
+/// Populated only when the `nvidia` feature is enabled and an NVIDIA driver
+/// is present.  AMD / Intel GPUs show up in `system_info` but do not yet
+/// provide real-time utilisation metrics.
+#[derive(Serialize, Clone)]
+pub struct GpuSample {
+    /// GPU index (0-based, matches nvidia-smi order).
+    pub index:             u32,
+    /// Full device name, e.g. "NVIDIA GeForce RTX 4090".
+    pub name:              String,
+    /// Overall GPU engine utilisation (0–100 %).
+    pub gpu_used_percent:  f64,
+    /// VRAM total in MB.
+    pub vram_total_mb:     f64,
+    /// VRAM currently in use in MB.
+    pub vram_used_mb:      f64,
+    /// VRAM available in MB.
+    pub vram_free_mb:      f64,
+    /// vram_free_mb / vram_total_mb × 100.
+    pub vram_free_percent: f64,
+    /// GPU core temperature in °C.
+    pub temperature_c:     u32,
+    /// NVENC hardware encoder utilisation (0–100 %).  None if unsupported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encoder_percent:   Option<u32>,
+    /// NVDEC hardware decoder utilisation (0–100 %).  None if unsupported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decoder_percent:   Option<u32>,
+    /// Current power draw in watts.  None if unsupported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub power_w:           Option<u32>,
+}
+
 /// Written every `poll_interval_ms` by system-monitor.
+///
+/// All thresholds are evaluated here; separate `*_alert` events are emitted
+/// alongside this entry when a threshold is crossed.
 #[derive(Serialize)]
 pub struct SystemResourceSampleData {
-    /// Percentage of all logical CPU cores in use (0–100).
-    pub cpu_used_percent:    f64,
+    // ── CPU ──────────────────────────────────────────────────────────────────
+    /// Percentage of all logical CPU cores currently in use (0–100).
+    pub cpu_used_percent: f64,
     /// Headroom left for new workloads: 100 − used.
-    pub cpu_free_percent:    f64,
+    pub cpu_free_percent: f64,
+    /// Per-core breakdown (useful for detecting single-core bottlenecks).
+    pub cores:            Vec<CoreSample>,
+
+    // ── Memory ───────────────────────────────────────────────────────────────
     pub memory_total_mb:     f64,
     pub memory_used_mb:      f64,
     /// Available memory (free + reclaimable on Linux; "Available" on Windows).
     pub memory_free_mb:      f64,
     pub memory_free_percent: f64,
-    pub disks:               Vec<DiskSample>,
+
+    // ── Swap / pagefile ───────────────────────────────────────────────────────
+    pub swap_total_mb:    f64,
+    pub swap_used_mb:     f64,
+    pub swap_used_percent: f64,
+
+    // ── Network ───────────────────────────────────────────────────────────────
+    pub network: Vec<NetworkSample>,
+
+    // ── Disk ──────────────────────────────────────────────────────────────────
+    pub disks: Vec<DiskSample>,
+
+    // ── GPU ───────────────────────────────────────────────────────────────────
+    /// One entry per detected NVIDIA GPU.  Empty when NVML is unavailable.
+    pub gpus: Vec<GpuSample>,
 }

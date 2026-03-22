@@ -26,6 +26,7 @@ crossbeam-channel    = "0.5"
 ctrlc                = { version = "3",   features = ["termination"] }
 notify-debouncer-mini = "0.4"
 num_cpus             = "1"
+nvml-wrapper         = { version = "0.10", optional = true }
 parking_lot          = "0.12"
 serde                = { version = "1",   features = ["derive"] }
 serde_json           = "1"
@@ -40,6 +41,11 @@ windows = { version = "0.58", features = [
     "Win32_System_ProcessStatus",
     "Win32_System_Threading",
 ] }
+
+# ── Features ──────────────────────────────────────────────────────────────────
+[features]
+# Enable to add NVIDIA GPU monitoring via NVML (requires NVIDIA driver).
+nvidia = ["nvml-wrapper"]
 
 # ── release profile: small, stripped binary ───────────────────────────────────
 [profile.release]

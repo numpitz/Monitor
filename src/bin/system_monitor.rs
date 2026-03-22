@@ -1,33 +1,32 @@
-//! system-monitor — system-wide free-resource logger.
+//! system-monitor — system-wide free-resource logger for video streaming.
 //!
 //! # Purpose
 //!
-//! Provides a continuous view of the *headroom* available to the host so that
-//! a video server (go2rtc) can be shown to have enough CPU, RAM and disk to
-//! operate reliably.  It writes NDJSON into its own log file while sharing
-//! `monitor.config.json` with process-monitor.
+//! Provides continuous visibility into the resources a video server (go2rtc +
+//! ffmpeg) needs in order to operate without frame drops or stream errors:
 //!
-//! # Usage
+//! - **CPU headroom** — system-wide and per-core (ffmpeg pins individual cores)
+//! - **Available RAM** — OOM kills degrade streams without warning
+//! - **Swap / pagefile** — high swap usage causes stutter in real-time encoding
+//! - **Network throughput & errors** — packet loss corrupts streams
+//! - **Disk free space** — recording failures and temp-file exhaustion
+//! - **GPU** — NVENC/NVDEC utilisation, VRAM, temperature (NVIDIA only via NVML)
 //!
-//!   system-monitor.exe <LOG_DIR>
-//!   system-monitor.exe <LOG_DIR> --no-console
+//! # Alerting model
 //!
-//! # Thread model
+//! Every metric supports two configurable thresholds:
+//! - `*_warn_*`  → logged at **WARN** level (approaching a limit)
+//! - `*_alert_*` → logged at **ERROR** level (limit breached, action required)
 //!
-//! ```text
-//! main thread
-//!   ├── config-watcher thread   (notify debouncer, reloads Arc<RwLock<Config>>)
-//!   ├── writer thread           (receives serialised lines via channel, writes NDJSON)
-//!   └── monitor loop            (CPU / RAM / disk sampling, runs on main thread)
-//! ```
+//! # GPU support
 //!
-//! # CPU measurement note
+//! Build with `--features nvidia` to enable NVIDIA GPU monitoring via NVML
+//! (part of the NVIDIA driver — no extra install required on a GPU machine):
 //!
-//! `sysinfo` computes CPU usage over the interval between two consecutive
-//! `refresh_cpu_usage()` calls.  The first call on startup establishes the
-//! baseline (returns 0 %); every subsequent call inside the loop uses the
-//! `poll_interval_ms` sleep as the measurement window — giving accurate
-//! readings without any additional sleep.
+//!   cargo build --release --features nvidia
+//!
+//! AMD and Intel GPUs are detected and listed in `system_info` at startup but
+//! do not yet provide real-time utilisation metrics.
 
 use anyhow::Result;
 use clap::Parser;
@@ -42,7 +41,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use sysinfo::{Disks, System};
+use sysinfo::{Disks, Networks, System};
 
 use process_monitor::{
     cprint,
@@ -52,6 +51,10 @@ use process_monitor::{
     watch_config,
     writer::LogWriter,
 };
+
+// NVML is only compiled in when the `nvidia` feature is enabled.
+#[cfg(feature = "nvidia")]
+use nvml_wrapper::{enum_wrappers::device::TemperatureSensor, Nvml};
 
 const MONITOR: &str = "system_monitor";
 
@@ -66,6 +69,115 @@ struct Args {
     /// Detach from the console window (run silently in the background)
     #[arg(long)]
     no_console: bool,
+}
+
+// ── NVML GPU monitor (NVIDIA only) ────────────────────────────────────────────
+
+/// Wraps optional NVML access so the rest of the code can call `.sample()`
+/// unconditionally and receive an empty Vec when NVML is not available.
+struct GpuMonitor {
+    #[cfg(feature = "nvidia")]
+    nvml: Option<Nvml>,
+    #[cfg(not(feature = "nvidia"))]
+    _phantom: (),
+}
+
+impl GpuMonitor {
+    fn init(no_console: bool) -> Self {
+        #[cfg(feature = "nvidia")]
+        {
+            match Nvml::init() {
+                Ok(nvml) => {
+                    cprint!(no_console, "[system-monitor] NVML initialised — NVIDIA GPU monitoring active");
+                    return Self { nvml: Some(nvml) };
+                }
+                Err(e) => {
+                    cprint!(no_console, "[system-monitor] NVML unavailable ({e}) — GPU metrics disabled");
+                }
+            }
+            Self { nvml: None }
+        }
+        #[cfg(not(feature = "nvidia"))]
+        {
+            let _ = no_console;
+            Self { _phantom: () }
+        }
+    }
+
+    /// Collect a sample for every detected NVIDIA GPU.
+    fn sample(&self) -> Vec<GpuSample> {
+        #[cfg(feature = "nvidia")]
+        if let Some(nvml) = &self.nvml {
+            let count = match nvml.device_count() {
+                Ok(n) => n,
+                Err(_) => return Vec::new(),
+            };
+            let mut out = Vec::with_capacity(count as usize);
+            for i in 0..count {
+                if let Some(s) = sample_gpu(nvml, i) {
+                    out.push(s);
+                }
+            }
+            return out;
+        }
+        Vec::new()
+    }
+
+    /// Return the name of every detected GPU (used in `system_info`).
+    fn gpu_names(&self) -> Vec<String> {
+        #[cfg(feature = "nvidia")]
+        if let Some(nvml) = &self.nvml {
+            let count = nvml.device_count().unwrap_or(0);
+            return (0..count)
+                .filter_map(|i| nvml.device_by_index(i).ok())
+                .filter_map(|d| d.name().ok())
+                .collect();
+        }
+        Vec::new()
+    }
+
+    /// "nvml" when NVML is active, "none" otherwise.
+    fn backend(&self) -> &'static str {
+        #[cfg(feature = "nvidia")]
+        if self.nvml.is_some() { return "nvml"; }
+        "none"
+    }
+}
+
+/// Sample one NVIDIA GPU by index.  Returns None if any mandatory query fails.
+#[cfg(feature = "nvidia")]
+fn sample_gpu(nvml: &Nvml, index: u32) -> Option<GpuSample> {
+    let device = nvml.device_by_index(index).ok()?;
+    let name   = device.name().ok()?;
+
+    let util      = device.utilization_rates().ok()?;
+    let mem       = device.memory_info().ok()?;
+    let temp      = device.temperature(TemperatureSensor::Gpu).ok()?;
+
+    let vram_total_mb = mem.total as f64 / 1_048_576.0;
+    let vram_used_mb  = mem.used  as f64 / 1_048_576.0;
+    let vram_free_mb  = mem.free  as f64 / 1_048_576.0;
+
+    // Encoder / decoder utilisation — may not be available on all GPU models.
+    let encoder_percent = device.encoder_utilization().ok().map(|e| e.utilization);
+    let decoder_percent = device.decoder_utilization().ok().map(|d| d.utilization);
+
+    // Power in milliwatts → watts.
+    let power_w = device.power_usage().ok().map(|mw| mw / 1_000);
+
+    Some(GpuSample {
+        index,
+        name,
+        gpu_used_percent:  round2(util.gpu as f64),
+        vram_total_mb:     round2(vram_total_mb),
+        vram_used_mb:      round2(vram_used_mb),
+        vram_free_mb:      round2(vram_free_mb),
+        vram_free_percent: round2(pct(vram_free_mb, vram_total_mb)),
+        temperature_c:     temp,
+        encoder_percent,
+        decoder_percent,
+        power_w,
+    })
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -104,7 +216,6 @@ fn main() -> Result<()> {
         MONITOR,
     )?;
 
-    // ── Write initial monitor_start ───────────────────────────────────────────
     let start = LogEntry::info(MONITOR, "monitor_start", MonitorStartData {
         pid:            monitor_pid,
         log_file:       log_writer.current_log_file_name(),
@@ -118,7 +229,7 @@ fn main() -> Result<()> {
         monitor_pid, log_writer.current_log_file_name()
     );
 
-    // ── Event channel (monitor loop → writer thread) ──────────────────────────
+    // ── Event channel ─────────────────────────────────────────────────────────
     let (tx, rx) = bounded::<String>(256);
 
     // ── Writer thread ─────────────────────────────────────────────────────────
@@ -130,7 +241,6 @@ fn main() -> Result<()> {
                     cprint!(no_console, "[writer] error: {e}");
                 }
             }
-            // Channel closed → monitor loop is done.  Write stop marker.
             let stop = LogEntry::info(MONITOR, "monitor_stop", MonitorStopData {
                 pid:       monitor_pid,
                 reason:    "shutdown",
@@ -152,7 +262,7 @@ fn main() -> Result<()> {
         thread::spawn(move || watch_config(MONITOR, config, log_dir, tx, no_console))
     };
 
-    // ── Shutdown flag (set by Ctrl-C handler) ─────────────────────────────────
+    // ── Shutdown flag ─────────────────────────────────────────────────────────
     let running = Arc::new(AtomicBool::new(true));
     {
         let r = running.clone();
@@ -160,114 +270,246 @@ fn main() -> Result<()> {
             .expect("failed to install Ctrl-C handler");
     }
 
-    // ── Initialise sysinfo ────────────────────────────────────────────────────
-    // First refresh_cpu_usage() call establishes the measurement baseline.
-    // CPU % on the next call will cover the poll_interval sleep as its window.
+    // ── Initialise subsystems ─────────────────────────────────────────────────
     let mut sys = System::new();
-    sys.refresh_cpu_usage();
+    sys.refresh_cpu_all(); // establishes CPU measurement baseline
 
-    cprint!(args.no_console,
-        "[system-monitor] poll interval {}ms", sm.poll_interval_ms
-    );
+    let mut networks = Networks::new_with_refreshed_list();
+
+    let gpu_monitor = GpuMonitor::init(args.no_console);
+
+    // ── Write system_info ─────────────────────────────────────────────────────
+    {
+        sys.refresh_memory();
+        let core_count    = sys.cpus().len();
+        let cpu_brand     = sys.cpus().first().map(|c| c.brand().to_string()).unwrap_or_default();
+        let cpu_arch      = System::cpu_arch().unwrap_or_default();
+        let mem_total_mb  = sys.total_memory() as f64 / 1_048_576.0;
+        let swap_total_mb = sys.total_swap()   as f64 / 1_048_576.0;
+        let os_name       = System::name()       .unwrap_or_default();
+        let os_version    = System::os_version() .unwrap_or_default();
+        let hostname      = System::host_name()  .unwrap_or_default();
+        let gpu_names     = gpu_monitor.gpu_names();
+        let gpu_backend   = gpu_monitor.backend();
+
+        cprint!(args.no_console,
+            "[system-monitor] {os_name} | {core_count} cores | {mem_total_mb:.0} MB RAM | GPU backend: {gpu_backend}"
+        );
+
+        send(&tx, &LogEntry::info(MONITOR, "system_info", SystemInfoData {
+            cpu_brand,
+            cpu_arch,
+            cpu_core_count:  core_count,
+            memory_total_mb: round2(mem_total_mb),
+            swap_total_mb:   round2(swap_total_mb),
+            os_name,
+            os_version,
+            hostname,
+            gpus:           gpu_names,
+            gpu_monitoring: gpu_backend.to_string(),
+        }));
+    }
+
+    cprint!(args.no_console, "[system-monitor] poll interval {}ms", sm.poll_interval_ms);
 
     // ── Main monitoring loop ──────────────────────────────────────────────────
     while running.load(Ordering::SeqCst) {
         let tick = Instant::now();
 
-        // Read current config once per iteration — picks up any hot-reload changes,
-        // including interval changes written by a future UI application.
-        let sm_cfg      = config.read().monitors.system_monitor.clone();
-        let log_cfg     = sm_cfg.log.clone();
-        let watch_disks = sm_cfg.watch_disks.clone();
+        // Read current config once per iteration (picks up hot-reload changes).
+        let sm_cfg       = config.read().monitors.system_monitor.clone();
+        let log_cfg      = sm_cfg.log.clone();
+        let watch_disks  = sm_cfg.watch_disks.clone();
+        let watch_ifaces = sm_cfg.watch_network_interfaces.clone();
         let poll_interval = Duration::from_millis(sm_cfg.poll_interval_ms);
 
+        let elapsed_secs = tick.elapsed().as_secs_f64().max(0.001);
+
         // ── CPU ───────────────────────────────────────────────────────────────
-        // refresh_cpu_usage uses the elapsed time since the previous call as
-        // its measurement window — here that window is the poll_interval sleep.
-        sys.refresh_cpu_usage();
+        sys.refresh_cpu_all();
         let cpu_used = sys.global_cpu_usage() as f64;
         let cpu_free = (100.0 - cpu_used).max(0.0);
+
+        let cores: Vec<CoreSample> = if log_cfg.cpu_per_core {
+            sys.cpus().iter().enumerate().map(|(id, cpu)| CoreSample {
+                id,
+                used_percent:  round2(cpu.cpu_usage() as f64),
+                frequency_mhz: cpu.frequency(),
+            }).collect()
+        } else {
+            Vec::new()
+        };
 
         // ── Memory ────────────────────────────────────────────────────────────
         sys.refresh_memory();
         let mem_total_mb = sys.total_memory()     as f64 / 1_048_576.0;
         let mem_used_mb  = sys.used_memory()      as f64 / 1_048_576.0;
         let mem_free_mb  = sys.available_memory() as f64 / 1_048_576.0;
-        let mem_free_pct = if mem_total_mb > 0.0 {
-            (mem_free_mb / mem_total_mb * 100.0).min(100.0)
+        let mem_free_pct = pct(mem_free_mb, mem_total_mb);
+
+        // ── Swap / pagefile ───────────────────────────────────────────────────
+        let swap_total_mb = sys.total_swap() as f64 / 1_048_576.0;
+        let swap_used_mb  = sys.used_swap()  as f64 / 1_048_576.0;
+        let swap_used_pct = pct(swap_used_mb, swap_total_mb);
+
+        // ── Network ───────────────────────────────────────────────────────────
+        networks.refresh();
+        let net_samples: Vec<NetworkSample> = if log_cfg.network {
+            networks.iter()
+                .filter(|(name, _)| iface_included(name, &watch_ifaces))
+                .map(|(name, data)| NetworkSample {
+                    interface:     name.clone(),
+                    rx_mb_per_sec: round2(data.received()    as f64 / 1_048_576.0 / elapsed_secs),
+                    tx_mb_per_sec: round2(data.transmitted() as f64 / 1_048_576.0 / elapsed_secs),
+                    rx_errors:     data.errors_on_received(),
+                    tx_errors:     data.errors_on_transmitted(),
+                })
+                .collect()
         } else {
-            0.0
+            Vec::new()
         };
 
         // ── Disks ─────────────────────────────────────────────────────────────
-        // Build a fresh disk snapshot each poll so we always see current values.
         let disks = Disks::new_with_refreshed_list();
+        let disk_samples: Vec<DiskSample> = if log_cfg.disk {
+            disks.list().iter()
+                .filter(|d| disk_included(&d.mount_point().to_string_lossy(), &watch_disks))
+                .map(|d| {
+                    let total_gb = d.total_space()     as f64 / 1_073_741_824.0;
+                    let free_gb  = d.available_space() as f64 / 1_073_741_824.0;
+                    DiskSample {
+                        path:         d.mount_point().to_string_lossy().into_owned(),
+                        total_gb:     round2(total_gb),
+                        free_gb:      round2(free_gb),
+                        free_percent: round2(pct(free_gb, total_gb)),
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
-        let watched: Vec<_> = disks.list().iter().filter(|d| {
-            if watch_disks.is_empty() {
-                return true; // report all disks when no filter is configured
-            }
-            let mp = d.mount_point().to_string_lossy().to_lowercase();
-            watch_disks.iter().any(|w| mp.starts_with(&w.to_lowercase()))
-        }).collect();
-
-        let disk_samples: Vec<DiskSample> = watched.iter().map(|d| {
-            let total_gb = d.total_space()     as f64 / 1_073_741_824.0;
-            let free_gb  = d.available_space() as f64 / 1_073_741_824.0;
-            let free_pct = if total_gb > 0.0 {
-                (free_gb / total_gb * 100.0).min(100.0)
-            } else {
-                0.0
-            };
-            DiskSample {
-                path:         d.mount_point().to_string_lossy().into_owned(),
-                total_gb:     round2(total_gb),
-                free_gb:      round2(free_gb),
-                free_percent: round2(free_pct),
-            }
-        }).collect();
+        // ── GPU (NVIDIA via NVML) ─────────────────────────────────────────────
+        let gpu_samples: Vec<GpuSample> = if log_cfg.gpu {
+            gpu_monitor.sample()
+        } else {
+            Vec::new()
+        };
 
         // ── Write sample ──────────────────────────────────────────────────────
         send(&tx, &LogEntry::info(MONITOR, "system_resource_sample", SystemResourceSampleData {
             cpu_used_percent:    round2(cpu_used),
             cpu_free_percent:    round2(cpu_free),
+            cores:               cores.clone(),
             memory_total_mb:     round2(mem_total_mb),
             memory_used_mb:      round2(mem_used_mb),
             memory_free_mb:      round2(mem_free_mb),
             memory_free_percent: round2(mem_free_pct),
-            disks:               disk_samples,
+            swap_total_mb:       round2(swap_total_mb),
+            swap_used_mb:        round2(swap_used_mb),
+            swap_used_percent:   round2(swap_used_pct),
+            network:             net_samples.clone(),
+            disks:               disk_samples.clone(),
+            gpus:                gpu_samples.clone(),
         }));
 
         // ── Threshold alerts ──────────────────────────────────────────────────
-        if let Some(th) = log_cfg.cpu_alert_free_percent {
-            if cpu_free < th {
-                send(&tx, &LogEntry::warn(MONITOR, "cpu_headroom_alert", WarningData {
-                    msg:    format!("CPU headroom {cpu_free:.1}% below threshold {th:.0}%"),
-                    detail: None,
-                }));
+
+        check_warn_alert(&tx, MONITOR, "cpu_headroom_alert",
+            cpu_free,
+            log_cfg.cpu_warn_free_percent, log_cfg.cpu_alert_free_percent,
+            |v, th| format!("CPU headroom {v:.1}% below threshold {th:.0}%"),
+            ThresholdDir::Below);
+
+        if log_cfg.cpu_per_core {
+            for core in &cores {
+                check_warn_alert(&tx, MONITOR, "cpu_core_alert",
+                    core.used_percent,
+                    log_cfg.cpu_core_warn_percent, log_cfg.cpu_core_alert_percent,
+                    |v, th| format!("Core {} used {v:.1}% above threshold {th:.0}%", core.id),
+                    ThresholdDir::Above);
             }
         }
 
-        if let Some(th) = log_cfg.memory_alert_free_mb {
-            if mem_free_mb < th {
-                send(&tx, &LogEntry::warn(MONITOR, "memory_headroom_alert", WarningData {
-                    msg:    format!("free RAM {mem_free_mb:.0} MB below threshold {th:.0} MB"),
-                    detail: None,
-                }));
-            }
+        check_warn_alert(&tx, MONITOR, "memory_headroom_alert",
+            mem_free_mb,
+            log_cfg.memory_warn_free_mb, log_cfg.memory_alert_free_mb,
+            |v, th| format!("free RAM {v:.0} MB below threshold {th:.0} MB"),
+            ThresholdDir::Below);
+
+        check_warn_alert(&tx, MONITOR, "swap_alert",
+            swap_used_pct,
+            log_cfg.swap_warn_used_percent, log_cfg.swap_alert_used_percent,
+            |v, th| format!("swap used {v:.1}% above threshold {th:.0}%"),
+            ThresholdDir::Above);
+
+        for disk in &disk_samples {
+            check_warn_alert(&tx, MONITOR, "disk_headroom_alert",
+                disk.free_gb,
+                log_cfg.disk_warn_free_gb, log_cfg.disk_alert_free_gb,
+                |v, th| format!("disk {} free {v:.1} GB below threshold {th:.0} GB", disk.path),
+                ThresholdDir::Below);
         }
 
-        if let Some(th) = log_cfg.disk_alert_free_gb {
-            for d in &watched {
-                let free_gb = d.available_space() as f64 / 1_073_741_824.0;
-                if free_gb < th {
-                    send(&tx, &LogEntry::warn(MONITOR, "disk_headroom_alert", WarningData {
-                        msg: format!(
-                            "disk {} free {free_gb:.1} GB below threshold {th:.0} GB",
-                            d.mount_point().display()
-                        ),
+        if let Some(th) = log_cfg.network_rx_warn_mbps {
+            for n in &net_samples {
+                if n.rx_mb_per_sec > th {
+                    send(&tx, &LogEntry::warn(MONITOR, "network_rx_alert", WarningData {
+                        msg: format!("{} RX {:.2} MB/s above threshold {th:.0} MB/s", n.interface, n.rx_mb_per_sec),
                         detail: None,
                     }));
+                }
+            }
+        }
+        if let Some(th) = log_cfg.network_tx_warn_mbps {
+            for n in &net_samples {
+                if n.tx_mb_per_sec > th {
+                    send(&tx, &LogEntry::warn(MONITOR, "network_tx_alert", WarningData {
+                        msg: format!("{} TX {:.2} MB/s above threshold {th:.0} MB/s", n.interface, n.tx_mb_per_sec),
+                        detail: None,
+                    }));
+                }
+            }
+        }
+        if log_cfg.network_error_alert {
+            for n in &net_samples {
+                if n.rx_errors > 0 || n.tx_errors > 0 {
+                    send(&tx, &LogEntry::error(MONITOR, "network_error_alert", WarningData {
+                        msg: format!("{} errors: rx={} tx={}", n.interface, n.rx_errors, n.tx_errors),
+                        detail: None,
+                    }));
+                }
+            }
+        }
+
+        // ── GPU alerts ────────────────────────────────────────────────────────
+        for gpu in &gpu_samples {
+            check_warn_alert(&tx, MONITOR, "gpu_util_alert",
+                gpu.gpu_used_percent,
+                log_cfg.gpu_warn_util_percent, log_cfg.gpu_alert_util_percent,
+                |v, th| format!("GPU {} utilisation {v:.1}% above threshold {th:.0}%", gpu.name),
+                ThresholdDir::Above);
+
+            check_warn_alert(&tx, MONITOR, "gpu_vram_alert",
+                gpu.vram_free_mb,
+                log_cfg.gpu_vram_warn_free_mb, log_cfg.gpu_vram_alert_free_mb,
+                |v, th| format!("GPU {} VRAM free {v:.0} MB below threshold {th:.0} MB", gpu.name),
+                ThresholdDir::Below);
+
+            check_warn_alert(&tx, MONITOR, "gpu_temp_alert",
+                gpu.temperature_c as f64,
+                log_cfg.gpu_temp_warn_c, log_cfg.gpu_temp_alert_c,
+                |v, th| format!("GPU {} temperature {v:.0}°C above threshold {th:.0}°C", gpu.name),
+                ThresholdDir::Above);
+
+            if let Some(enc) = gpu.encoder_percent {
+                if let Some(th) = log_cfg.gpu_encoder_warn_percent {
+                    if enc as f64 > th {
+                        send(&tx, &LogEntry::warn(MONITOR, "gpu_encoder_alert", WarningData {
+                            msg: format!("GPU {} NVENC encoder {enc}% above threshold {th:.0}%", gpu.name),
+                            detail: None,
+                        }));
+                    }
                 }
             }
         }
@@ -287,7 +529,51 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Round a float to 2 decimal places for clean JSON output.
-fn round2(v: f64) -> f64 {
-    (v * 100.0).round() / 100.0
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn round2(v: f64) -> f64 { (v * 100.0).round() / 100.0 }
+
+fn pct(part: f64, total: f64) -> f64 {
+    if total > 0.0 { (part / total * 100.0).clamp(0.0, 100.0) } else { 0.0 }
+}
+
+fn disk_included(mount: &str, watch_disks: &[String]) -> bool {
+    if watch_disks.is_empty() { return true; }
+    let m = mount.to_lowercase();
+    watch_disks.iter().any(|w| m.starts_with(&w.to_lowercase()))
+}
+
+fn iface_included(name: &str, watch_ifaces: &[String]) -> bool {
+    if name.to_lowercase().contains("loopback") { return false; }
+    if watch_ifaces.is_empty() { return true; }
+    watch_ifaces.iter().any(|w| w.eq_ignore_ascii_case(name))
+}
+
+enum ThresholdDir { Below, Above }
+
+fn check_warn_alert(
+    tx:       &crossbeam_channel::Sender<String>,
+    monitor:  &'static str,
+    event:    &'static str,
+    value:    f64,
+    warn_th:  Option<f64>,
+    alert_th: Option<f64>,
+    msg_fn:   impl Fn(f64, f64) -> String,
+    dir:      ThresholdDir,
+) {
+    let crossed = |th: f64| match dir {
+        ThresholdDir::Below => value < th,
+        ThresholdDir::Above => value > th,
+    };
+    if let Some(th) = alert_th {
+        if crossed(th) {
+            send(tx, &LogEntry::error(monitor, event, WarningData { msg: msg_fn(value, th), detail: None }));
+            return;
+        }
+    }
+    if let Some(th) = warn_th {
+        if crossed(th) {
+            send(tx, &LogEntry::warn(monitor, event, WarningData { msg: msg_fn(value, th), detail: None }));
+        }
+    }
 }
