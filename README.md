@@ -132,8 +132,8 @@ All three binaries read the same file.
 |-----|---------|-------------|
 | `enabled` | `true` | Set `false` to skip on startup |
 | `log_file` | `proc_resources.jsonl` | Base name for log files |
-| `resource_poll_interval_ms` | 5000 | Per-process CPU / RAM sample frequency |
-| `snapshot_interval_ms` | 60000 | Full process-tree snapshot frequency |
+| `resource_poll_interval_ms` | 5000 | Per-process CPU / RAM sample frequency (`0` = off) |
+| `snapshot_interval_ms` | 60000 | Full process-tree snapshot frequency (`0` = off) |
 | `watch_folders` | required | Absolute paths — every `.exe` here is watched |
 | `log.cpu_alert_threshold_percent` | null | WARN when a process exceeds this CPU % |
 | `log.memory_alert_mb` | null | WARN when a process exceeds this RAM (MB) |
@@ -146,7 +146,7 @@ All three binaries read the same file.
 |-----|---------|-------------|
 | `enabled` | `true` | Set `false` to skip on startup |
 | `log_file` | `sys_resources.jsonl` | Base name for log files |
-| `poll_interval_ms` | 30000 | How often to sample (30 s recommended) |
+| `poll_interval_ms` | 30000 | How often to sample (`0` = off; 30 s recommended) |
 | `watch_disks` | `[]` (all) | Mount points to report, e.g. `["C:\\"]` |
 | `watch_network_interfaces` | `[]` (all) | Interface names to report, e.g. `["Ethernet"]` |
 
