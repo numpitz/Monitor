@@ -1,0 +1,71 @@
+{
+  "log_rotation": {
+    "max_file_size_mb": 10,
+    "keep_files": 5
+  },
+  "ui": {
+    "refresh_secs": 5
+  },
+  "monitors": {
+    "process_monitor": {
+      "enabled": true,
+      "log_file": "proc_resources.jsonl",
+      "resource_poll_interval_ms": 5000,
+      "snapshot_interval_ms": 60000,
+      "watch_folders": [
+        "C:\\go2rtc\\bin"
+      ],
+      "log": {
+        "cpu_percent": true,
+        "memory_mb": true,
+        "handle_count": true,
+        "thread_count": true,
+        "process_spawn": true,
+        "process_exit": true,
+        "snapshot": true,
+        "cpu_alert_threshold_percent": null,
+        "memory_alert_mb": null
+      }
+    },
+    "system_monitor": {
+      "enabled": true,
+      "log_file": "sys_resources.jsonl",
+      "poll_interval_ms": 30000,
+      "watch_disks": [],
+      "watch_network_interfaces": [],
+      "log": {
+        "cpu_warn_free_percent": 30.0,
+        "cpu_alert_free_percent": 10.0,
+        "cpu_core_warn_percent": 85.0,
+        "cpu_core_alert_percent": 95.0,
+        "memory_warn_free_mb": 1000.0,
+        "memory_alert_free_mb": 500.0,
+        "swap_warn_used_percent": 30.0,
+        "swap_alert_used_percent": 70.0,
+        "disk_warn_free_gb": 20.0,
+        "disk_alert_free_gb": 10.0,
+        "network_rx_warn_mbps": null,
+        "network_tx_warn_mbps": null,
+        "network_error_alert": true,
+        "gpu_warn_util_percent": 80.0,
+        "gpu_alert_util_percent": 95.0,
+        "gpu_encoder_warn_percent": 80.0,
+        "gpu_vram_warn_free_mb": 500.0,
+        "gpu_vram_alert_free_mb": 200.0,
+        "gpu_temp_warn_c": 80.0,
+        "gpu_temp_alert_c": 90.0
+      }
+    },
+    "go2rtc_monitor": {
+      "enabled": false,
+      "log_file": "go2rtc_streams.jsonl",
+      "api_url": "http://localhost:1984",
+      "poll_interval_ms": 10000,
+      "log": {
+        "stream_changes": true,
+        "consumer_changes": true,
+        "stream_sample": true
+      }
+    }
+  }
+}

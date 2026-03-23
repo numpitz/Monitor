@@ -4,9 +4,12 @@
 # Runtime log files produced by the monitor
 *.jsonl
 
-# Local runtime config (contains machine-specific paths)
-# Commit monitor.config.json.example instead if you want to share a template
+# Runtime config files (contain machine-specific paths — not committed)
 monitor.config.json
+logs/monitor.config.json
+
+# Exception: the template in config/ IS committed — it is the source of truth
+!config/monitor.config.json
 
 # Windows artifacts
 *.pdb
