@@ -203,7 +203,7 @@ Reads the latest `sys_resources.N.jsonl` and shows the last `system_resource_sam
 - **RAM** — used / total MB and free % with a progress bar
 - **Swap** — used / total MB with a progress bar
 - **Network** — per-interface RX / TX MB/s, error count, and dropped packet count
-- **Disks** — per-mount free GB and free % with a progress bar
+- **Disks** — per-mount free GB, free % with a progress bar, and real-time read / write MB/s
 - **GPU** — utilisation %, VRAM free MB, temperature °C, NVENC encoder % per card
   — **only visible when built with `--features nvidia`** (see [GPU monitoring](#gpu-monitoring-nvidia));
   the section is hidden entirely when the log contains no GPU data
@@ -523,7 +523,8 @@ Written every `poll_interval_ms`.
       "rx_dropped": 0, "tx_dropped": 0 }
   ],
   "disks": [
-    { "path": "C:\\", "total_gb": 476.84, "free_gb": 210.12, "free_percent": 44.06 }
+    { "path": "C:\\", "total_gb": 476.84, "free_gb": 210.12, "free_percent": 44.06,
+      "read_mb_per_sec": 12.5, "write_mb_per_sec": 3.2 }
   ],
   "gpus": [
     { "index": 0, "name": "NVIDIA GeForce RTX 4090",

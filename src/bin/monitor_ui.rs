@@ -66,10 +66,12 @@ struct NetRow {
 }
 
 struct DiskRow {
-    path:     String,
-    total_gb: f64,
-    free_gb:  f64,
-    free_pct: f64,
+    path:          String,
+    total_gb:      f64,
+    free_gb:       f64,
+    free_pct:      f64,
+    read_mb_per_sec:  f64,
+    write_mb_per_sec: f64,
 }
 
 struct GpuRow {
@@ -766,7 +768,7 @@ impl eframe::App for MonitorApp {
                         ui.add_space(8.0);
                         ui.label(egui::RichText::new("Disks").strong());
                         egui::Grid::new("disk_grid")
-                            .num_columns(4).spacing([16.0, 3.0]).striped(true)
+                            .num_columns(6).spacing([16.0, 3.0]).striped(true)
                             .show(ui, |ui| {
                                 for d in &s.disks {
                                     let used_frac = 1.0 - (d.free_pct as f32 / 100.0);
@@ -778,6 +780,8 @@ impl eframe::App for MonitorApp {
                                     ui.label(format!("/ {:.1} GB", d.total_gb));
                                     ui.label(egui::RichText::new(format!("{:.1}% free", d.free_pct))
                                         .color(threshold_color(d.free_gb, 20.0, 10.0, Dir::Below)));
+                                    ui.label(format!("RD {:.2} MB/s", d.read_mb_per_sec));
+                                    ui.label(format!("WR {:.2} MB/s", d.write_mb_per_sec));
                                     ui.end_row();
                                 }
                             });
@@ -942,10 +946,12 @@ fn parse_sys_sample(v: &serde_json::Value) -> SysSample {
 
     let disks = v.get("disks").and_then(|d| d.as_array())
         .map(|arr| arr.iter().map(|d| DiskRow {
-            path:     val_str(d, "path"),
-            total_gb: d.get("total_gb")     .and_then(|x| x.as_f64()).unwrap_or(0.0),
-            free_gb:  d.get("free_gb")      .and_then(|x| x.as_f64()).unwrap_or(0.0),
-            free_pct: d.get("free_percent") .and_then(|x| x.as_f64()).unwrap_or(0.0),
+            path:             val_str(d, "path"),
+            total_gb:         d.get("total_gb")        .and_then(|x| x.as_f64()).unwrap_or(0.0),
+            free_gb:          d.get("free_gb")         .and_then(|x| x.as_f64()).unwrap_or(0.0),
+            free_pct:         d.get("free_percent")    .and_then(|x| x.as_f64()).unwrap_or(0.0),
+            read_mb_per_sec:  d.get("read_mb_per_sec") .and_then(|x| x.as_f64()).unwrap_or(0.0),
+            write_mb_per_sec: d.get("write_mb_per_sec").and_then(|x| x.as_f64()).unwrap_or(0.0),
         }).collect())
         .unwrap_or_default();
 
