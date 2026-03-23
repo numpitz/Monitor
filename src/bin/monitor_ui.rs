@@ -105,9 +105,15 @@ struct StreamRow {
     ts:              String,
 }
 
+// ── Tab selection ─────────────────────────────────────────────────────────────
+
+#[derive(PartialEq)]
+enum Tab { Runtime, Configuration }
+
 // ── App state ─────────────────────────────────────────────────────────────────
 
 struct MonitorApp {
+    selected_tab: Tab,
     log_dir: PathBuf,
     config:  Result<Config, String>,
 
@@ -185,6 +191,7 @@ impl MonitorApp {
                     go2rtc_last_refresh: None,
                     go2rtc_source_file:  String::new(),
                     ui_refresh_secs,
+                    selected_tab: Tab::Runtime,
                 }
             }
             Err(e) => Self {
@@ -213,6 +220,7 @@ impl MonitorApp {
                 go2rtc_last_refresh: None,
                 go2rtc_source_file:  String::new(),
                 ui_refresh_secs:     5,
+                selected_tab: Tab::Runtime,
             },
         };
         app.refresh_processes();
@@ -436,472 +444,465 @@ impl eframe::App for MonitorApp {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.heading("Monitor Configuration");
-                ui.label(
-                    egui::RichText::new(self.log_dir.display().to_string())
-                        .small()
-                        .color(egui::Color32::GRAY),
-                );
-                ui.add_space(12.0);
-
-                if let Err(ref msg) = self.config {
-                    ui.colored_label(egui::Color32::RED, format!("Cannot load config: {msg}"));
-                    return;
-                }
-
-                // ── Process Monitor config ─────────────────────────────────────
-                ui.group(|ui| {
-                    ui.set_width(ui.available_width());
-                    ui.horizontal(|ui| {
-                        let before = self.proc_enabled;
-                        ui.checkbox(&mut self.proc_enabled, egui::RichText::new("Process Monitor").strong());
-                        if self.proc_enabled != before { self.dirty = true; self.status.clear(); }
-                        if !self.proc_enabled {
-                            ui.colored_label(egui::Color32::YELLOW, "  disabled — monitor will not start");
-                        }
-                    });
-                    ui.separator();
-                    ui.add_enabled_ui(self.proc_enabled, |ui| {
-                        egui::Grid::new("proc_grid")
-                            .num_columns(3)
-                            .spacing([12.0, 8.0])
-                            .show(ui, |ui| {
-                            ui.label("Resource poll interval");
-                            let before = self.proc_poll_secs;
-                            ui.add(egui::Slider::new(&mut self.proc_poll_secs, 0..=60)
-                                .suffix(" s").clamping(egui::SliderClamping::Always));
-                            ui.label(interval_hint(self.proc_poll_secs));
-                            if self.proc_poll_secs != before { self.dirty = true; self.status.clear(); }
-                            ui.end_row();
-
-                            ui.label("Snapshot interval");
-                            let before = self.proc_snapshot_secs;
-                            ui.add(egui::Slider::new(&mut self.proc_snapshot_secs, 0..=600)
-                                .suffix(" s").clamping(egui::SliderClamping::Always));
-                            ui.label(interval_hint(self.proc_snapshot_secs));
-                            if self.proc_snapshot_secs != before { self.dirty = true; self.status.clear(); }
-                            ui.end_row();
-
-                            ui.label("Response interval");
-                            let before = self.proc_min_tick_ms;
-                            ui.add(egui::Slider::new(&mut self.proc_min_tick_ms, 50..=5000)
-                                .suffix(" ms").clamping(egui::SliderClamping::Always));
-                            ui.label(egui::RichText::new("config change / Ctrl-C reaction time").color(egui::Color32::GRAY).small());
-                            if self.proc_min_tick_ms != before { self.dirty = true; self.status.clear(); }
-                            ui.end_row();
-                        });
-                    });
-                });
-
-                ui.add_space(10.0);
-
-                // ── System Monitor config ──────────────────────────────────────
-                ui.group(|ui| {
-                    ui.set_width(ui.available_width());
-                    ui.horizontal(|ui| {
-                        let before = self.sys_enabled;
-                        ui.checkbox(&mut self.sys_enabled, egui::RichText::new("System Monitor").strong());
-                        if self.sys_enabled != before { self.dirty = true; self.status.clear(); }
-                        if !self.sys_enabled {
-                            ui.colored_label(egui::Color32::YELLOW, "  disabled — monitor will not start");
-                        }
-                    });
-                    ui.separator();
-                    ui.add_enabled_ui(self.sys_enabled, |ui| {
-                        egui::Grid::new("sys_grid")
-                            .num_columns(3)
-                            .spacing([12.0, 8.0])
-                            .show(ui, |ui| {
-                            ui.label("Poll interval");
-                            let before = self.sys_poll_secs;
-                            ui.add(egui::Slider::new(&mut self.sys_poll_secs, 0..=300)
-                                .suffix(" s").clamping(egui::SliderClamping::Always));
-                            ui.label(interval_hint(self.sys_poll_secs));
-                            if self.sys_poll_secs != before { self.dirty = true; self.status.clear(); }
-                            ui.end_row();
-
-                            ui.label("Response interval");
-                            let before = self.sys_min_tick_ms;
-                            ui.add(egui::Slider::new(&mut self.sys_min_tick_ms, 50..=5000)
-                                .suffix(" ms").clamping(egui::SliderClamping::Always));
-                            ui.label(egui::RichText::new("config change / Ctrl-C reaction time").color(egui::Color32::GRAY).small());
-                            if self.sys_min_tick_ms != before { self.dirty = true; self.status.clear(); }
-                            ui.end_row();
-                        });
-                    });
-                });
-
-                ui.add_space(10.0);
-
-                // ── go2rtc Monitor config ──────────────────────────────────────
-                ui.group(|ui| {
-                    ui.set_width(ui.available_width());
-                    ui.horizontal(|ui| {
-                        let before = self.go2rtc_enabled;
-                        ui.checkbox(&mut self.go2rtc_enabled, egui::RichText::new("go2rtc Monitor").strong());
-                        if self.go2rtc_enabled != before { self.dirty = true; self.status.clear(); }
-                        if !self.go2rtc_enabled {
-                            ui.colored_label(egui::Color32::YELLOW, "  disabled — monitor will not start");
-                        }
-                    });
-                    ui.separator();
-                    ui.add_enabled_ui(self.go2rtc_enabled, |ui| {
-                        egui::Grid::new("go2rtc_grid")
-                            .num_columns(3)
-                            .spacing([12.0, 8.0])
-                            .show(ui, |ui| {
-                            ui.label("API URL");
-                            let before = self.go2rtc_api_url.clone();
-                            ui.add(egui::TextEdit::singleline(&mut self.go2rtc_api_url)
-                                .desired_width(260.0)
-                                .hint_text("http://localhost:1984"));
-                            ui.label(egui::RichText::new("base URL of go2rtc").color(egui::Color32::GRAY).small());
-                            if self.go2rtc_api_url != before { self.dirty = true; self.status.clear(); }
-                            ui.end_row();
-
-                            ui.label("Poll interval");
-                            let before = self.go2rtc_poll_secs;
-                            ui.add(egui::Slider::new(&mut self.go2rtc_poll_secs, 0..=300)
-                                .suffix(" s").clamping(egui::SliderClamping::Always));
-                            ui.label(interval_hint(self.go2rtc_poll_secs));
-                            if self.go2rtc_poll_secs != before { self.dirty = true; self.status.clear(); }
-                            ui.end_row();
-
-                            ui.label("Response interval");
-                            let before = self.go2rtc_min_tick_ms;
-                            ui.add(egui::Slider::new(&mut self.go2rtc_min_tick_ms, 50..=5000)
-                                .suffix(" ms").clamping(egui::SliderClamping::Always));
-                            ui.label(egui::RichText::new("config change / Ctrl-C reaction time").color(egui::Color32::GRAY).small());
-                            if self.go2rtc_min_tick_ms != before { self.dirty = true; self.status.clear(); }
-                            ui.end_row();
-                        });
-                    });
-                });
-
-                ui.add_space(16.0);
-
-                // ── Save button ────────────────────────────────────────────────
-                ui.horizontal(|ui| {
-                    let save_btn = ui.add_enabled(self.dirty, egui::Button::new("💾  Save"));
-                    if save_btn.clicked() { self.save(); }
-                    if self.dirty {
-                        ui.colored_label(egui::Color32::YELLOW, "  Unsaved changes");
-                    } else if !self.status.is_empty() {
-                        ui.colored_label(egui::Color32::GREEN, format!("  ✓  {}", self.status));
-                    }
-                });
-
-                // ── UI refresh interval ────────────────────────────────────────
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    ui.label("UI auto-refresh");
-                    let before = self.ui_refresh_secs;
-                    ui.add(egui::Slider::new(&mut self.ui_refresh_secs, 0..=60)
-                        .suffix(" s")
-                        .clamping(egui::SliderClamping::Always));
-                    ui.label(egui::RichText::new(interval_hint(self.ui_refresh_secs))
-                        .color(egui::Color32::GRAY).small());
-                    if self.ui_refresh_secs != before { self.dirty = true; self.status.clear(); }
-                });
-
-                // ── Watched Processes viewer ───────────────────────────────────
-                ui.add_space(16.0);
-                ui.separator();
-                ui.add_space(8.0);
-
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Watched Processes").strong());
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("⟳  Refresh").clicked() {
-                            self.refresh_processes();
-                        }
-                        if !self.proc_source_file.is_empty() {
-                            ui.label(egui::RichText::new(&self.proc_source_file)
-                                .small().color(egui::Color32::GRAY));
-                        }
-                    });
-                });
-                ui.add_space(4.0);
-
-                if self.proc_rows.is_empty() {
-                    ui.label(egui::RichText::new("No processes found — is process-monitor running?")
-                        .color(egui::Color32::GRAY));
-                } else {
-                    egui::Grid::new("proc_header")
-                        .num_columns(7).spacing([12.0, 2.0])
-                        .show(ui, |ui| {
-                            for label in ["Name", "PID", "CPU %", "Mem MB", "Handles", "Threads", "Last seen"] {
-                                ui.label(egui::RichText::new(label).strong().small());
-                            }
-                            ui.end_row();
-                        });
-                    ui.separator();
-                    egui::ScrollArea::vertical()
-                        .id_salt("proc_scroll")
-                        .max_height(180.0)
-                        .show(ui, |ui| {
-                            egui::Grid::new("proc_table")
-                                .num_columns(7).spacing([12.0, 4.0]).striped(true)
-                                .show(ui, |ui| {
-                                    for row in &self.proc_rows {
-                                        let color = if row.alive { egui::Color32::WHITE } else { egui::Color32::GRAY };
-                                        ui.label(egui::RichText::new(&row.name).color(color));
-                                        ui.label(egui::RichText::new(row.pid.to_string()).color(color));
-                                        if row.alive {
-                                            ui.label(format!("{:.1}", row.cpu_percent));
-                                            ui.label(format!("{:.1}", row.memory_mb));
-                                            ui.label(row.handles.to_string());
-                                            ui.label(row.threads.to_string());
-                                        } else {
-                                            for _ in 0..4 {
-                                                ui.label(egui::RichText::new("—").color(egui::Color32::GRAY));
-                                            }
-                                        }
-                                        ui.label(egui::RichText::new(&row.last_seen)
-                                            .small().color(egui::Color32::GRAY));
-                                        ui.end_row();
-                                    }
-                                });
-                        });
-                }
-
-                // ── System Resources viewer ────────────────────────────────────
-                ui.add_space(16.0);
-                ui.separator();
-                ui.add_space(8.0);
-
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("System Resources").strong());
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("⟳  Refresh").clicked() {
-                            self.refresh_system();
-                        }
-                        if !self.sys_source_file.is_empty() {
-                            ui.label(egui::RichText::new(&self.sys_source_file)
-                                .small().color(egui::Color32::GRAY));
-                        }
-                    });
-                });
-                ui.add_space(4.0);
-
-                if self.sys_sample.is_none() {
-                    ui.label(egui::RichText::new("No data — is system-monitor running?")
-                        .color(egui::Color32::GRAY));
-                } else {
-                    // Unwrap is safe: we just checked is_none above.
-                    let s = self.sys_sample.as_ref().unwrap();
-
-                    ui.label(egui::RichText::new(format!("Last sample:  {}", s.ts))
+            // ── Header ────────────────────────────────────────────────────────
+            ui.horizontal(|ui| {
+                ui.heading("Monitor");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new(self.log_dir.display().to_string())
                         .small().color(egui::Color32::GRAY));
-                    ui.add_space(6.0);
-
-                    // CPU
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("CPU ").strong().monospace());
-                        ui.add(egui::ProgressBar::new(s.cpu_used_pct as f32 / 100.0)
-                            .desired_width(220.0)
-                            .fill(threshold_color(s.cpu_used_pct, 70.0, 90.0, Dir::Above))
-                            .text(format!("{:.1}% used", s.cpu_used_pct)));
-                        ui.label(egui::RichText::new(format!("{:.1}% free", s.cpu_free_pct))
-                            .color(threshold_color(s.cpu_free_pct, 30.0, 10.0, Dir::Below)));
-                    });
-
-                    // RAM
-                    let mem_used_frac = (s.memory_used_mb / s.memory_total_mb.max(1.0)) as f32;
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("RAM ").strong().monospace());
-                        ui.add(egui::ProgressBar::new(mem_used_frac)
-                            .desired_width(220.0)
-                            .fill(threshold_color(s.memory_free_pct, 30.0, 15.0, Dir::Below))
-                            .text(format!("{:.0} / {:.0} MB", s.memory_used_mb, s.memory_total_mb)));
-                        ui.label(egui::RichText::new(format!("{:.1}% free", s.memory_free_pct))
-                            .color(threshold_color(s.memory_free_pct, 30.0, 15.0, Dir::Below)));
-                    });
-
-                    // Swap
-                    if s.swap_total_mb > 0.0 {
-                        let swap_frac = (s.swap_used_mb / s.swap_total_mb.max(1.0)) as f32;
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("Swap").strong().monospace());
-                            ui.add(egui::ProgressBar::new(swap_frac)
-                                .desired_width(220.0)
-                                .fill(threshold_color(s.swap_used_pct, 30.0, 70.0, Dir::Above))
-                                .text(format!("{:.0} / {:.0} MB", s.swap_used_mb, s.swap_total_mb)));
-                            ui.label(egui::RichText::new(format!("{:.1}% used", s.swap_used_pct))
-                                .color(threshold_color(s.swap_used_pct, 30.0, 70.0, Dir::Above)));
-                        });
-                    }
-
-                    // Network
-                    if !s.network.is_empty() {
-                        ui.add_space(8.0);
-                        ui.label(egui::RichText::new("Network").strong());
-                        egui::Grid::new("net_grid")
-                            .num_columns(5).spacing([16.0, 3.0]).striped(true)
-                            .show(ui, |ui| {
-                                for n in &s.network {
-                                    ui.label(&n.interface);
-                                    ui.label(format!("DN  {:.2} MB/s", n.rx));
-                                    ui.label(format!("UP  {:.2} MB/s", n.tx));
-                                    if n.errors > 0 {
-                                        ui.label(egui::RichText::new(format!("{} errors", n.errors))
-                                            .color(egui::Color32::RED));
-                                    } else {
-                                        ui.label(egui::RichText::new("no errors")
-                                            .color(egui::Color32::GRAY));
-                                    }
-                                    if n.dropped > 0 {
-                                        ui.label(egui::RichText::new(format!("{} dropped", n.dropped))
-                                            .color(egui::Color32::YELLOW));
-                                    } else {
-                                        ui.label(egui::RichText::new("no drops")
-                                            .color(egui::Color32::GRAY));
-                                    }
-                                    ui.end_row();
-                                }
-                            });
-                    }
-
-                    // Disks
-                    if !s.disks.is_empty() {
-                        ui.add_space(8.0);
-                        ui.label(egui::RichText::new("Disks").strong());
-                        egui::Grid::new("disk_grid")
-                            .num_columns(6).spacing([16.0, 3.0]).striped(true)
-                            .show(ui, |ui| {
-                                for d in &s.disks {
-                                    let used_frac = 1.0 - (d.free_pct as f32 / 100.0);
-                                    ui.label(&d.path);
-                                    ui.add(egui::ProgressBar::new(used_frac)
-                                        .desired_width(140.0)
-                                        .fill(threshold_color(d.free_gb, 20.0, 10.0, Dir::Below))
-                                        .text(format!("{:.1} GB free", d.free_gb)));
-                                    ui.label(format!("/ {:.1} GB", d.total_gb));
-                                    ui.label(egui::RichText::new(format!("{:.1}% free", d.free_pct))
-                                        .color(threshold_color(d.free_gb, 20.0, 10.0, Dir::Below)));
-                                    ui.label(format!("RD {:.2} MB/s", d.read_mb_per_sec));
-                                    ui.label(format!("WR {:.2} MB/s", d.write_mb_per_sec));
-                                    ui.end_row();
-                                }
-                            });
-                    }
-
-                    // GPUs
-                    if !s.gpus.is_empty() {
-                        ui.add_space(8.0);
-                        ui.label(egui::RichText::new("GPU").strong());
-                        egui::Grid::new("gpu_grid")
-                            .num_columns(5).spacing([16.0, 3.0]).striped(true)
-                            .show(ui, |ui| {
-                                for g in &s.gpus {
-                                    ui.label(&g.name);
-                                    ui.label(egui::RichText::new(format!("{:.0}% util", g.util_pct))
-                                        .color(threshold_color(g.util_pct, 80.0, 95.0, Dir::Above)));
-                                    ui.label(egui::RichText::new(format!("{:.0} MB VRAM free", g.vram_free_mb))
-                                        .color(threshold_color(g.vram_free_mb, 500.0, 200.0, Dir::Below)));
-                                    if let Some(t) = g.temp_c {
-                                        ui.label(egui::RichText::new(format!("{}°C", t))
-                                            .color(threshold_color(t as f64, 80.0, 90.0, Dir::Above)));
-                                    } else {
-                                        ui.label(egui::RichText::new("—").color(egui::Color32::GRAY));
-                                    }
-                                    if let Some(enc) = g.encoder_pct {
-                                        ui.label(egui::RichText::new(format!("Enc {}%", enc))
-                                            .color(threshold_color(enc as f64, 80.0, 95.0, Dir::Above)));
-                                    } else {
-                                        ui.label("");
-                                    }
-                                    ui.end_row();
-                                }
-                            });
-                    }
-                }
-
-                // ── go2rtc Streams viewer ──────────────────────────────────────
-                ui.add_space(16.0);
-                ui.separator();
-                ui.add_space(8.0);
-
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("go2rtc Streams").strong());
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("⟳  Refresh").clicked() {
-                            self.refresh_streams();
-                        }
-                        if !self.go2rtc_source_file.is_empty() {
-                            ui.label(egui::RichText::new(&self.go2rtc_source_file)
-                                .small().color(egui::Color32::GRAY));
-                        }
-                    });
                 });
-                ui.add_space(4.0);
+            });
+            ui.add_space(4.0);
 
-                if self.go2rtc_stream_rows.is_empty() {
-                    ui.label(egui::RichText::new("No stream data — is go2rtc-monitor running?")
-                        .color(egui::Color32::GRAY));
-                } else {
-                    egui::Grid::new("stream_header")
-                        .num_columns(5).spacing([12.0, 2.0])
-                        .show(ui, |ui| {
-                            for label in ["Name", "Status", "Producer URL", "Consumers", "Last seen"] {
-                                ui.label(egui::RichText::new(label).strong().small());
+            // ── Tab bar ───────────────────────────────────────────────────────
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.selected_tab, Tab::Runtime,       "Runtime");
+                ui.selectable_value(&mut self.selected_tab, Tab::Configuration, "Configuration");
+            });
+            ui.separator();
+            ui.add_space(4.0);
+
+            // ── Tab content ───────────────────────────────────────────────────
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                match self.selected_tab {
+
+                    // ══════════════════════════════════════════════════════════
+                    Tab::Runtime => {
+                        // Refresh-all button + auto-refresh slider
+                        ui.horizontal(|ui| {
+                            if ui.small_button("⟳  Refresh all").clicked() {
+                                self.refresh_processes();
+                                self.refresh_system();
+                                self.refresh_streams();
                             }
-                            ui.end_row();
+                            ui.separator();
+                            ui.label("Auto-refresh every");
+                            let before = self.ui_refresh_secs;
+                            ui.add(egui::Slider::new(&mut self.ui_refresh_secs, 0..=60)
+                                .suffix(" s").clamping(egui::SliderClamping::Always));
+                            if self.ui_refresh_secs != before { self.dirty = true; self.status.clear(); }
+                            ui.label(egui::RichText::new(interval_hint(self.ui_refresh_secs))
+                                .small().color(egui::Color32::GRAY));
                         });
-                    ui.separator();
-                    egui::ScrollArea::vertical()
-                        .id_salt("stream_scroll")
-                        .max_height(180.0)
-                        .show(ui, |ui| {
-                            egui::Grid::new("stream_table")
-                                .num_columns(5).spacing([12.0, 4.0]).striped(true)
+
+                        // ── Watched Processes ──────────────────────────────────
+                        ui.add_space(12.0);
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Watched Processes").strong());
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.small_button("⟳").clicked() { self.refresh_processes(); }
+                                if !self.proc_source_file.is_empty() {
+                                    ui.label(egui::RichText::new(&self.proc_source_file)
+                                        .small().color(egui::Color32::GRAY));
+                                }
+                            });
+                        });
+                        ui.add_space(4.0);
+
+                        if self.proc_rows.is_empty() {
+                            ui.label(egui::RichText::new("No processes — is process-monitor running?")
+                                .color(egui::Color32::GRAY));
+                        } else {
+                            egui::Grid::new("proc_header")
+                                .num_columns(7).spacing([12.0, 2.0])
                                 .show(ui, |ui| {
-                                    for row in &self.go2rtc_stream_rows {
-                                        ui.label(&row.name);
-                                        if row.producer_active {
-                                            ui.colored_label(
-                                                egui::Color32::from_rgb(80, 180, 80),
-                                                "Active",
-                                            );
-                                        } else {
-                                            ui.colored_label(egui::Color32::GRAY, "Inactive");
-                                        }
-                                        // URL column: truncated text + copy button
-                                        ui.horizontal(|ui| {
-                                            if row.producer_url.is_empty() {
-                                                ui.label(egui::RichText::new("—")
-                                                    .color(egui::Color32::GRAY).small());
-                                            } else {
-                                                let short: String = row.producer_url
-                                                    .chars().take(40)
-                                                    .chain(if row.producer_url.chars().count() > 40 {
-                                                        Some('…')
-                                                    } else {
-                                                        None
-                                                    })
-                                                    .collect();
-                                                ui.label(egui::RichText::new(short)
-                                                    .small().monospace())
-                                                    .on_hover_text(&row.producer_url);
-                                                if ui.small_button("⧉")
-                                                    .on_hover_text("Copy URL to clipboard")
-                                                    .clicked()
-                                                {
-                                                    ui.output_mut(|o| {
-                                                        o.copied_text = row.producer_url.clone();
-                                                    });
+                                    for label in ["Name", "PID", "CPU %", "Mem MB", "Handles", "Threads", "Last seen"] {
+                                        ui.label(egui::RichText::new(label).strong().small());
+                                    }
+                                    ui.end_row();
+                                });
+                            ui.separator();
+                            egui::ScrollArea::vertical()
+                                .id_salt("proc_scroll")
+                                .max_height(200.0)
+                                .show(ui, |ui| {
+                                    egui::Grid::new("proc_table")
+                                        .num_columns(7).spacing([12.0, 4.0]).striped(true)
+                                        .show(ui, |ui| {
+                                            for row in &self.proc_rows {
+                                                let color = if row.alive { egui::Color32::WHITE } else { egui::Color32::GRAY };
+                                                ui.label(egui::RichText::new(&row.name).color(color));
+                                                ui.label(egui::RichText::new(row.pid.to_string()).color(color));
+                                                if row.alive {
+                                                    ui.label(format!("{:.1}", row.cpu_percent));
+                                                    ui.label(format!("{:.1}", row.memory_mb));
+                                                    ui.label(row.handles.to_string());
+                                                    ui.label(row.threads.to_string());
+                                                } else {
+                                                    for _ in 0..4 {
+                                                        ui.label(egui::RichText::new("—").color(egui::Color32::GRAY));
+                                                    }
                                                 }
+                                                ui.label(egui::RichText::new(&row.last_seen)
+                                                    .small().color(egui::Color32::GRAY));
+                                                ui.end_row();
                                             }
                                         });
-                                        ui.label(row.consumer_count.to_string());
-                                        ui.label(egui::RichText::new(&row.ts)
-                                            .small().color(egui::Color32::GRAY));
-                                        ui.end_row();
-                                    }
                                 });
+                        }
+
+                        // ── System Resources ───────────────────────────────────
+                        ui.add_space(12.0);
+                        ui.separator();
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("System Resources").strong());
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.small_button("⟳").clicked() { self.refresh_system(); }
+                                if !self.sys_source_file.is_empty() {
+                                    ui.label(egui::RichText::new(&self.sys_source_file)
+                                        .small().color(egui::Color32::GRAY));
+                                }
+                            });
                         });
-                }
+                        ui.add_space(4.0);
+
+                        if self.sys_sample.is_none() {
+                            ui.label(egui::RichText::new("No data — is system-monitor running?")
+                                .color(egui::Color32::GRAY));
+                        } else {
+                            let s = self.sys_sample.as_ref().unwrap();
+
+                            ui.label(egui::RichText::new(format!("Last sample: {}", s.ts))
+                                .small().color(egui::Color32::GRAY));
+                            ui.add_space(6.0);
+
+                            // CPU
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("CPU ").strong().monospace());
+                                ui.add(egui::ProgressBar::new(s.cpu_used_pct as f32 / 100.0)
+                                    .desired_width(220.0)
+                                    .fill(threshold_color(s.cpu_used_pct, 70.0, 90.0, Dir::Above))
+                                    .text(format!("{:.1}% used", s.cpu_used_pct)));
+                                ui.label(egui::RichText::new(format!("{:.1}% free", s.cpu_free_pct))
+                                    .color(threshold_color(s.cpu_free_pct, 30.0, 10.0, Dir::Below)));
+                            });
+
+                            // RAM
+                            let mem_used_frac = (s.memory_used_mb / s.memory_total_mb.max(1.0)) as f32;
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("RAM ").strong().monospace());
+                                ui.add(egui::ProgressBar::new(mem_used_frac)
+                                    .desired_width(220.0)
+                                    .fill(threshold_color(s.memory_free_pct, 30.0, 15.0, Dir::Below))
+                                    .text(format!("{:.0} / {:.0} MB", s.memory_used_mb, s.memory_total_mb)));
+                                ui.label(egui::RichText::new(format!("{:.1}% free", s.memory_free_pct))
+                                    .color(threshold_color(s.memory_free_pct, 30.0, 15.0, Dir::Below)));
+                            });
+
+                            // Swap
+                            if s.swap_total_mb > 0.0 {
+                                let swap_frac = (s.swap_used_mb / s.swap_total_mb.max(1.0)) as f32;
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new("Swap").strong().monospace());
+                                    ui.add(egui::ProgressBar::new(swap_frac)
+                                        .desired_width(220.0)
+                                        .fill(threshold_color(s.swap_used_pct, 30.0, 70.0, Dir::Above))
+                                        .text(format!("{:.0} / {:.0} MB", s.swap_used_mb, s.swap_total_mb)));
+                                    ui.label(egui::RichText::new(format!("{:.1}% used", s.swap_used_pct))
+                                        .color(threshold_color(s.swap_used_pct, 30.0, 70.0, Dir::Above)));
+                                });
+                            }
+
+                            // Network
+                            if !s.network.is_empty() {
+                                ui.add_space(8.0);
+                                ui.label(egui::RichText::new("Network").strong());
+                                egui::Grid::new("net_grid")
+                                    .num_columns(5).spacing([16.0, 3.0]).striped(true)
+                                    .show(ui, |ui| {
+                                        for n in &s.network {
+                                            ui.label(&n.interface);
+                                            ui.label(format!("DN  {:.2} MB/s", n.rx));
+                                            ui.label(format!("UP  {:.2} MB/s", n.tx));
+                                            if n.errors > 0 {
+                                                ui.label(egui::RichText::new(format!("{} errors", n.errors))
+                                                    .color(egui::Color32::RED));
+                                            } else {
+                                                ui.label(egui::RichText::new("no errors").color(egui::Color32::GRAY));
+                                            }
+                                            if n.dropped > 0 {
+                                                ui.label(egui::RichText::new(format!("{} dropped", n.dropped))
+                                                    .color(egui::Color32::YELLOW));
+                                            } else {
+                                                ui.label(egui::RichText::new("no drops").color(egui::Color32::GRAY));
+                                            }
+                                            ui.end_row();
+                                        }
+                                    });
+                            }
+
+                            // Disks
+                            if !s.disks.is_empty() {
+                                ui.add_space(8.0);
+                                ui.label(egui::RichText::new("Disks").strong());
+                                egui::Grid::new("disk_grid")
+                                    .num_columns(6).spacing([16.0, 3.0]).striped(true)
+                                    .show(ui, |ui| {
+                                        for d in &s.disks {
+                                            let used_frac = 1.0 - (d.free_pct as f32 / 100.0);
+                                            ui.label(&d.path);
+                                            ui.add(egui::ProgressBar::new(used_frac)
+                                                .desired_width(140.0)
+                                                .fill(threshold_color(d.free_gb, 20.0, 10.0, Dir::Below))
+                                                .text(format!("{:.1} GB free", d.free_gb)));
+                                            ui.label(format!("/ {:.1} GB", d.total_gb));
+                                            ui.label(egui::RichText::new(format!("{:.1}% free", d.free_pct))
+                                                .color(threshold_color(d.free_gb, 20.0, 10.0, Dir::Below)));
+                                            ui.label(format!("RD {:.2} MB/s", d.read_mb_per_sec));
+                                            ui.label(format!("WR {:.2} MB/s", d.write_mb_per_sec));
+                                            ui.end_row();
+                                        }
+                                    });
+                            }
+
+                            // GPUs
+                            if !s.gpus.is_empty() {
+                                ui.add_space(8.0);
+                                ui.label(egui::RichText::new("GPU").strong());
+                                egui::Grid::new("gpu_grid")
+                                    .num_columns(5).spacing([16.0, 3.0]).striped(true)
+                                    .show(ui, |ui| {
+                                        for g in &s.gpus {
+                                            ui.label(&g.name);
+                                            ui.label(egui::RichText::new(format!("{:.0}% util", g.util_pct))
+                                                .color(threshold_color(g.util_pct, 80.0, 95.0, Dir::Above)));
+                                            ui.label(egui::RichText::new(format!("{:.0} MB VRAM free", g.vram_free_mb))
+                                                .color(threshold_color(g.vram_free_mb, 500.0, 200.0, Dir::Below)));
+                                            if let Some(t) = g.temp_c {
+                                                ui.label(egui::RichText::new(format!("{}°C", t))
+                                                    .color(threshold_color(t as f64, 80.0, 90.0, Dir::Above)));
+                                            } else {
+                                                ui.label(egui::RichText::new("—").color(egui::Color32::GRAY));
+                                            }
+                                            if let Some(enc) = g.encoder_pct {
+                                                ui.label(egui::RichText::new(format!("Enc {}%", enc))
+                                                    .color(threshold_color(enc as f64, 80.0, 95.0, Dir::Above)));
+                                            } else {
+                                                ui.label("");
+                                            }
+                                            ui.end_row();
+                                        }
+                                    });
+                            }
+                        }
+
+                        // ── go2rtc Streams ─────────────────────────────────────
+                        ui.add_space(12.0);
+                        ui.separator();
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("go2rtc Streams").strong());
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.small_button("⟳").clicked() { self.refresh_streams(); }
+                                if !self.go2rtc_source_file.is_empty() {
+                                    ui.label(egui::RichText::new(&self.go2rtc_source_file)
+                                        .small().color(egui::Color32::GRAY));
+                                }
+                            });
+                        });
+                        ui.add_space(4.0);
+
+                        if self.go2rtc_stream_rows.is_empty() {
+                            ui.label(egui::RichText::new("No stream data — is go2rtc-monitor running?")
+                                .color(egui::Color32::GRAY));
+                        } else {
+                            egui::Grid::new("stream_header")
+                                .num_columns(5).spacing([12.0, 2.0])
+                                .show(ui, |ui| {
+                                    for label in ["Name", "Status", "Producer URL", "Consumers", "Last seen"] {
+                                        ui.label(egui::RichText::new(label).strong().small());
+                                    }
+                                    ui.end_row();
+                                });
+                            ui.separator();
+                            egui::ScrollArea::vertical()
+                                .id_salt("stream_scroll")
+                                .max_height(200.0)
+                                .show(ui, |ui| {
+                                    egui::Grid::new("stream_table")
+                                        .num_columns(5).spacing([12.0, 4.0]).striped(true)
+                                        .show(ui, |ui| {
+                                            for row in &self.go2rtc_stream_rows {
+                                                ui.label(&row.name);
+                                                if row.producer_active {
+                                                    ui.colored_label(egui::Color32::from_rgb(80, 180, 80), "Active");
+                                                } else {
+                                                    ui.colored_label(egui::Color32::GRAY, "Inactive");
+                                                }
+                                                ui.horizontal(|ui| {
+                                                    if row.producer_url.is_empty() {
+                                                        ui.label(egui::RichText::new("—")
+                                                            .color(egui::Color32::GRAY).small());
+                                                    } else {
+                                                        let short: String = row.producer_url
+                                                            .chars().take(40)
+                                                            .chain(if row.producer_url.chars().count() > 40 { Some('…') } else { None })
+                                                            .collect();
+                                                        ui.label(egui::RichText::new(short).small().monospace())
+                                                            .on_hover_text(&row.producer_url);
+                                                        if ui.small_button("⧉").on_hover_text("Copy URL").clicked() {
+                                                            ui.output_mut(|o| o.copied_text = row.producer_url.clone());
+                                                        }
+                                                    }
+                                                });
+                                                ui.label(row.consumer_count.to_string());
+                                                ui.label(egui::RichText::new(&row.ts)
+                                                    .small().color(egui::Color32::GRAY));
+                                                ui.end_row();
+                                            }
+                                        });
+                                });
+                        }
+                    } // Tab::Runtime
+
+                    // ══════════════════════════════════════════════════════════
+                    Tab::Configuration => {
+                        if let Err(ref msg) = self.config {
+                            ui.colored_label(egui::Color32::RED, format!("Cannot load config: {msg}"));
+                            return;
+                        }
+
+                        // ── Process Monitor ────────────────────────────────────
+                        ui.group(|ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                let before = self.proc_enabled;
+                                ui.checkbox(&mut self.proc_enabled, egui::RichText::new("Process Monitor").strong());
+                                if self.proc_enabled != before { self.dirty = true; self.status.clear(); }
+                                if !self.proc_enabled {
+                                    ui.colored_label(egui::Color32::YELLOW, "  disabled");
+                                }
+                            });
+                            ui.separator();
+                            ui.add_enabled_ui(self.proc_enabled, |ui| {
+                                egui::Grid::new("proc_grid").num_columns(3).spacing([12.0, 8.0]).show(ui, |ui| {
+                                    ui.label("Resource poll interval");
+                                    let before = self.proc_poll_secs;
+                                    ui.add(egui::Slider::new(&mut self.proc_poll_secs, 0..=60).suffix(" s").clamping(egui::SliderClamping::Always));
+                                    ui.label(interval_hint(self.proc_poll_secs));
+                                    if self.proc_poll_secs != before { self.dirty = true; self.status.clear(); }
+                                    ui.end_row();
+
+                                    ui.label("Snapshot interval");
+                                    let before = self.proc_snapshot_secs;
+                                    ui.add(egui::Slider::new(&mut self.proc_snapshot_secs, 0..=600).suffix(" s").clamping(egui::SliderClamping::Always));
+                                    ui.label(interval_hint(self.proc_snapshot_secs));
+                                    if self.proc_snapshot_secs != before { self.dirty = true; self.status.clear(); }
+                                    ui.end_row();
+
+                                    ui.label("Response interval");
+                                    let before = self.proc_min_tick_ms;
+                                    ui.add(egui::Slider::new(&mut self.proc_min_tick_ms, 50..=5000).suffix(" ms").clamping(egui::SliderClamping::Always));
+                                    ui.label(egui::RichText::new("Ctrl-C / config reaction time").color(egui::Color32::GRAY).small());
+                                    if self.proc_min_tick_ms != before { self.dirty = true; self.status.clear(); }
+                                    ui.end_row();
+                                });
+                            });
+                        });
+
+                        ui.add_space(8.0);
+
+                        // ── System Monitor ─────────────────────────────────────
+                        ui.group(|ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                let before = self.sys_enabled;
+                                ui.checkbox(&mut self.sys_enabled, egui::RichText::new("System Monitor").strong());
+                                if self.sys_enabled != before { self.dirty = true; self.status.clear(); }
+                                if !self.sys_enabled {
+                                    ui.colored_label(egui::Color32::YELLOW, "  disabled");
+                                }
+                            });
+                            ui.separator();
+                            ui.add_enabled_ui(self.sys_enabled, |ui| {
+                                egui::Grid::new("sys_grid").num_columns(3).spacing([12.0, 8.0]).show(ui, |ui| {
+                                    ui.label("Poll interval");
+                                    let before = self.sys_poll_secs;
+                                    ui.add(egui::Slider::new(&mut self.sys_poll_secs, 0..=300).suffix(" s").clamping(egui::SliderClamping::Always));
+                                    ui.label(interval_hint(self.sys_poll_secs));
+                                    if self.sys_poll_secs != before { self.dirty = true; self.status.clear(); }
+                                    ui.end_row();
+
+                                    ui.label("Response interval");
+                                    let before = self.sys_min_tick_ms;
+                                    ui.add(egui::Slider::new(&mut self.sys_min_tick_ms, 50..=5000).suffix(" ms").clamping(egui::SliderClamping::Always));
+                                    ui.label(egui::RichText::new("Ctrl-C / config reaction time").color(egui::Color32::GRAY).small());
+                                    if self.sys_min_tick_ms != before { self.dirty = true; self.status.clear(); }
+                                    ui.end_row();
+                                });
+                            });
+                        });
+
+                        ui.add_space(8.0);
+
+                        // ── go2rtc Monitor ─────────────────────────────────────
+                        ui.group(|ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                let before = self.go2rtc_enabled;
+                                ui.checkbox(&mut self.go2rtc_enabled, egui::RichText::new("go2rtc Monitor").strong());
+                                if self.go2rtc_enabled != before { self.dirty = true; self.status.clear(); }
+                                if !self.go2rtc_enabled {
+                                    ui.colored_label(egui::Color32::YELLOW, "  disabled");
+                                }
+                            });
+                            ui.separator();
+                            ui.add_enabled_ui(self.go2rtc_enabled, |ui| {
+                                egui::Grid::new("go2rtc_grid").num_columns(3).spacing([12.0, 8.0]).show(ui, |ui| {
+                                    ui.label("API URL");
+                                    let before = self.go2rtc_api_url.clone();
+                                    ui.add(egui::TextEdit::singleline(&mut self.go2rtc_api_url)
+                                        .desired_width(260.0).hint_text("http://localhost:1984"));
+                                    ui.label(egui::RichText::new("base URL of go2rtc").color(egui::Color32::GRAY).small());
+                                    if self.go2rtc_api_url != before { self.dirty = true; self.status.clear(); }
+                                    ui.end_row();
+
+                                    ui.label("Poll interval");
+                                    let before = self.go2rtc_poll_secs;
+                                    ui.add(egui::Slider::new(&mut self.go2rtc_poll_secs, 0..=300).suffix(" s").clamping(egui::SliderClamping::Always));
+                                    ui.label(interval_hint(self.go2rtc_poll_secs));
+                                    if self.go2rtc_poll_secs != before { self.dirty = true; self.status.clear(); }
+                                    ui.end_row();
+
+                                    ui.label("Response interval");
+                                    let before = self.go2rtc_min_tick_ms;
+                                    ui.add(egui::Slider::new(&mut self.go2rtc_min_tick_ms, 50..=5000).suffix(" ms").clamping(egui::SliderClamping::Always));
+                                    ui.label(egui::RichText::new("Ctrl-C / config reaction time").color(egui::Color32::GRAY).small());
+                                    if self.go2rtc_min_tick_ms != before { self.dirty = true; self.status.clear(); }
+                                    ui.end_row();
+                                });
+                            });
+                        });
+
+                        ui.add_space(8.0);
+
+                        // ── UI refresh ─────────────────────────────────────────
+                        ui.horizontal(|ui| {
+                            ui.label("UI auto-refresh");
+                            let before = self.ui_refresh_secs;
+                            ui.add(egui::Slider::new(&mut self.ui_refresh_secs, 0..=60)
+                                .suffix(" s").clamping(egui::SliderClamping::Always));
+                            ui.label(egui::RichText::new(interval_hint(self.ui_refresh_secs))
+                                .color(egui::Color32::GRAY).small());
+                            if self.ui_refresh_secs != before { self.dirty = true; self.status.clear(); }
+                        });
+
+                        ui.add_space(12.0);
+
+                        // ── Save button ────────────────────────────────────────
+                        ui.horizontal(|ui| {
+                            let save_btn = ui.add_enabled(self.dirty, egui::Button::new("💾  Save"));
+                            if save_btn.clicked() { self.save(); }
+                            if self.dirty {
+                                ui.colored_label(egui::Color32::YELLOW, "  Unsaved changes");
+                            } else if !self.status.is_empty() {
+                                ui.colored_label(egui::Color32::GREEN, format!("  ✓  {}", self.status));
+                            }
+                        });
+                    } // Tab::Configuration
+
+                } // match
             }); // ScrollArea
         }); // CentralPanel
     }
