@@ -254,9 +254,27 @@ Settings persisted by `monitor-ui`.
 | `resource_poll_interval_ms` | 5000 | Per-process CPU / RAM sample frequency (`0` = off) |
 | `snapshot_interval_ms` | 60000 | Full process-tree snapshot frequency (`0` = off) |
 | `min_tick_ms` | 500 | Sleep granularity — how quickly the monitor reacts to interval changes or Ctrl-C (min 50) |
-| `watch_folders` | required | Absolute paths — every `.exe` here is watched |
+| `watch_folders` | required | Absolute paths — **every process whose executable path starts with one of these folders** is watched, regardless of executable name |
 | `log.cpu_alert_threshold_percent` | null | WARN when a process exceeds this CPU % |
 | `log.memory_alert_mb` | null | WARN when a process exceeds this RAM (MB) |
+
+#### Process discovery
+
+The monitor uses a **path-based** filter: any running process whose full executable
+path begins with one of the `watch_folders` paths is automatically tracked — no
+`.exe` file list needs to be maintained.
+
+| Scenario | Behaviour |
+|----------|-----------|
+| New process starts from a watched folder | Detected on the next poll tick, logged as `process_spawned` |
+| Process exits | Detected on the next poll tick, logged as `process_exited` |
+| New `.exe` dropped into a watched folder and started | Picked up immediately — no config change or restart required |
+| Process with same name running from a different folder | Ignored — the full path must match |
+| `watch_folders` changed in config | Previous exclusion cache is cleared; all running processes are re-evaluated within `min_tick_ms` |
+
+Each new PID is verified once via `QueryFullProcessImageNameW`.  Processes outside
+the watched folders are cached in an exclusion list and never re-checked, keeping
+CPU overhead near zero even on busy systems.
 
 ---
 

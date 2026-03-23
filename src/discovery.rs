@@ -27,7 +27,6 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::{
     collections::{HashMap, HashSet},
-    path::PathBuf,
     time::Instant,
 };
 
@@ -70,8 +69,6 @@ pub struct ProcessInfo {
 // ── ProcessDiscovery ──────────────────────────────────────────────────────────
 
 pub struct ProcessDiscovery {
-    /// Lower-cased exe filenames found in watch folders (e.g. `"go2rtc.exe"`).
-    watch_names: HashSet<String>,
     /// Lower-cased absolute paths of watch folders (trailing backslash).
     watch_folders: Vec<String>,
     /// PID → confirmed process in a watch folder.
@@ -83,7 +80,6 @@ pub struct ProcessDiscovery {
 impl ProcessDiscovery {
     pub fn new(watch_folders: &[String]) -> Result<Self> {
         let mut disc = Self {
-            watch_names:     HashSet::new(),
             watch_folders:   Vec::new(),
             known_processes: HashMap::new(),
             excluded_pids:   HashSet::new(),
@@ -92,7 +88,9 @@ impl ProcessDiscovery {
         Ok(disc)
     }
 
-    /// Replace the watch-folder list and rebuild the name set.
+    /// Replace the watch-folder list.  Every process whose full executable
+    /// path starts with one of these folders is watched — no pre-scanning of
+    /// folder contents required.
     /// Called on config reload.
     pub fn set_watch_folders(&mut self, folders: &[String]) {
         self.watch_folders = folders
@@ -104,20 +102,9 @@ impl ProcessDiscovery {
             })
             .collect();
 
-        self.watch_names.clear();
-        for folder in &self.watch_folders {
-            let path = PathBuf::from(folder);
-            if let Ok(entries) = std::fs::read_dir(&path) {
-                for entry in entries.flatten() {
-                    let p = entry.path();
-                    if p.extension().and_then(|e| e.to_str()) == Some("exe") {
-                        if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                            self.watch_names.insert(name.to_lowercase());
-                        }
-                    }
-                }
-            }
-        }
+        // Clear the excluded cache so any previously-rejected PID is
+        // re-evaluated against the new folder list.
+        self.excluded_pids.clear();
     }
 
     /// Immutable view of currently known processes.
@@ -157,13 +144,6 @@ impl ProcessDiscovery {
 
         // ── Detect spawns ─────────────────────────────────────────────────────
         for &(pid, ref name, thread_count) in &snapshot {
-            let name_lower = name.to_lowercase();
-
-            // Fast path: not a watched name at all
-            if !self.watch_names.contains(&name_lower) {
-                continue;
-            }
-
             if let Some(info) = self.known_processes.get_mut(&pid) {
                 // Already tracked — refresh thread count
                 info.thread_count = thread_count;
