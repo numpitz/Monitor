@@ -218,7 +218,8 @@ pub struct GpuSample {
     /// vram_free_mb / vram_total_mb × 100.
     pub vram_free_percent: f64,
     /// GPU core temperature in °C.
-    pub temperature_c:     u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature_c:     Option<u32>,
     /// NVENC hardware encoder utilisation (0–100 %).  None if unsupported.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub encoder_percent:   Option<u32>,

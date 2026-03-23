@@ -75,7 +75,7 @@ struct GpuRow {
     name:         String,
     util_pct:     f64,
     vram_free_mb: f64,
-    temp_c:       u32,
+    temp_c:       Option<u32>,
     encoder_pct:  Option<u32>,
 }
 
@@ -739,8 +739,8 @@ impl eframe::App for MonitorApp {
                             .show(ui, |ui| {
                                 for n in &s.network {
                                     ui.label(&n.interface);
-                                    ui.label(format!("↓ {:.2} MB/s", n.rx));
-                                    ui.label(format!("↑ {:.2} MB/s", n.tx));
+                                    ui.label(format!("DN  {:.2} MB/s", n.rx));
+                                    ui.label(format!("UP  {:.2} MB/s", n.tx));
                                     if n.errors > 0 {
                                         ui.label(egui::RichText::new(format!("{} errors", n.errors))
                                             .color(egui::Color32::RED));
@@ -788,8 +788,12 @@ impl eframe::App for MonitorApp {
                                         .color(threshold_color(g.util_pct, 80.0, 95.0, Dir::Above)));
                                     ui.label(egui::RichText::new(format!("{:.0} MB VRAM free", g.vram_free_mb))
                                         .color(threshold_color(g.vram_free_mb, 500.0, 200.0, Dir::Below)));
-                                    ui.label(egui::RichText::new(format!("{}°C", g.temp_c))
-                                        .color(threshold_color(g.temp_c as f64, 80.0, 90.0, Dir::Above)));
+                                    if let Some(t) = g.temp_c {
+                                        ui.label(egui::RichText::new(format!("{}°C", t))
+                                            .color(threshold_color(t as f64, 80.0, 90.0, Dir::Above)));
+                                    } else {
+                                        ui.label(egui::RichText::new("—").color(egui::Color32::GRAY));
+                                    }
                                     if let Some(enc) = g.encoder_pct {
                                         ui.label(egui::RichText::new(format!("Enc {}%", enc))
                                             .color(threshold_color(enc as f64, 80.0, 95.0, Dir::Above)));
@@ -940,7 +944,7 @@ fn parse_sys_sample(v: &serde_json::Value) -> SysSample {
             name:         val_str(g, "name"),
             util_pct:     g.get("gpu_used_percent").and_then(|x| x.as_f64()).unwrap_or(0.0),
             vram_free_mb: g.get("vram_free_mb")    .and_then(|x| x.as_f64()).unwrap_or(0.0),
-            temp_c:       g.get("temperature_c")   .and_then(|x| x.as_u64()).unwrap_or(0) as u32,
+            temp_c:       g.get("temperature_c").and_then(|x| x.as_u64()).map(|x| x as u32),
             encoder_pct:  g.get("encoder_percent") .and_then(|x| x.as_u64()).map(|x| x as u32),
         }).collect())
         .unwrap_or_default();

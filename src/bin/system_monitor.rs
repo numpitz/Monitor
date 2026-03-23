@@ -56,6 +56,11 @@ use process_monitor::{
 #[cfg(feature = "nvidia")]
 use nvml_wrapper::{enum_wrappers::device::TemperatureSensor, Nvml};
 
+// PDH GPU fallback — compiled on Windows regardless of the nvidia feature flag.
+#[cfg(windows)]
+#[path = "../pdh_gpu.rs"]
+mod pdh_gpu;
+
 const MONITOR: &str = "system_monitor";
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
@@ -80,6 +85,8 @@ struct GpuMonitor {
     nvml: Option<Nvml>,
     #[cfg(not(feature = "nvidia"))]
     _phantom: (),
+    #[cfg(windows)]
+    pdh: Option<pdh_gpu::PdhGpuMonitor>,
 }
 
 impl GpuMonitor {
@@ -89,37 +96,90 @@ impl GpuMonitor {
             match Nvml::init() {
                 Ok(nvml) => {
                     cprint!(no_console, "[system-monitor] NVML initialised — NVIDIA GPU monitoring active");
-                    return Self { nvml: Some(nvml) };
+                    return Self {
+                        nvml: Some(nvml),
+                        #[cfg(windows)]
+                        pdh: None,
+                    };
                 }
                 Err(e) => {
-                    cprint!(no_console, "[system-monitor] NVML unavailable ({e}) — GPU metrics disabled");
+                    cprint!(no_console, "[system-monitor] NVML unavailable ({e}) — trying PDH fallback");
                 }
             }
-            Self { nvml: None }
         }
-        #[cfg(not(feature = "nvidia"))]
+
+        #[cfg(windows)]
+        {
+            let pdh = pdh_gpu::PdhGpuMonitor::init();
+            let ok  = pdh.is_some();
+            if ok {
+                cprint!(no_console, "[system-monitor] PDH GPU monitoring active (cross-vendor)");
+            } else {
+                cprint!(no_console, "[system-monitor] no GPU monitoring available");
+            }
+            return Self {
+                #[cfg(feature = "nvidia")]
+                nvml: None,
+                #[cfg(not(feature = "nvidia"))]
+                _phantom: (),
+                pdh,
+            };
+        }
+
+        #[cfg(not(windows))]
         {
             let _ = no_console;
-            Self { _phantom: () }
+            Self {
+                #[cfg(feature = "nvidia")]
+                nvml: None,
+                #[cfg(not(feature = "nvidia"))]
+                _phantom: (),
+            }
         }
     }
 
-    /// Collect a sample for every detected NVIDIA GPU.
-    fn sample(&self) -> Vec<GpuSample> {
+    /// Collect a sample for every detected GPU.
+    fn sample(&mut self) -> Vec<GpuSample> {
+        // NVIDIA via NVML (highest fidelity — temperature, power, etc.)
         #[cfg(feature = "nvidia")]
         if let Some(nvml) = &self.nvml {
             let count = match nvml.device_count() {
-                Ok(n) => n,
+                Ok(n)  => n,
                 Err(_) => return Vec::new(),
             };
             let mut out = Vec::with_capacity(count as usize);
             for i in 0..count {
-                if let Some(s) = sample_gpu(nvml, i) {
-                    out.push(s);
-                }
+                if let Some(s) = sample_gpu(nvml, i) { out.push(s); }
             }
-            return out;
+            if !out.is_empty() { return out; }
         }
+
+        // Cross-vendor fallback via PDH + DXGI
+        #[cfg(windows)]
+        if let Some(pdh) = &mut self.pdh {
+            return pdh.sample().into_iter().map(|s| {
+                let vram_free_mb  = (s.vram_total_mb - s.vram_used_mb).max(0.0);
+                let vram_free_pct = if s.vram_total_mb > 0.0 {
+                    vram_free_mb / s.vram_total_mb * 100.0
+                } else {
+                    0.0
+                };
+                GpuSample {
+                    index:             s.index,
+                    name:              s.name,
+                    gpu_used_percent:  round2(s.gpu_used_pct),
+                    vram_total_mb:     round2(s.vram_total_mb),
+                    vram_used_mb:      round2(s.vram_used_mb),
+                    vram_free_mb:      round2(vram_free_mb),
+                    vram_free_percent: round2(vram_free_pct),
+                    temperature_c:     None,   // not available via PDH
+                    encoder_percent:   Some(s.encoder_pct as u32),
+                    decoder_percent:   Some(s.decoder_pct as u32),
+                    power_w:           None,
+                }
+            }).collect();
+        }
+
         Vec::new()
     }
 
@@ -128,18 +188,25 @@ impl GpuMonitor {
         #[cfg(feature = "nvidia")]
         if let Some(nvml) = &self.nvml {
             let count = nvml.device_count().unwrap_or(0);
-            return (0..count)
+            let names: Vec<String> = (0..count)
                 .filter_map(|i| nvml.device_by_index(i).ok())
                 .filter_map(|d| d.name().ok())
                 .collect();
+            if !names.is_empty() { return names; }
+        }
+        #[cfg(windows)]
+        if let Some(pdh) = &self.pdh {
+            return pdh.adapter_names();
         }
         Vec::new()
     }
 
-    /// "nvml" when NVML is active, "none" otherwise.
+    /// "nvml" when NVML is active, "pdh" for cross-vendor fallback, "none" otherwise.
     fn backend(&self) -> &'static str {
         #[cfg(feature = "nvidia")]
         if self.nvml.is_some() { return "nvml"; }
+        #[cfg(windows)]
+        if self.pdh.is_some()  { return "pdh";  }
         "none"
     }
 }
@@ -173,7 +240,7 @@ fn sample_gpu(nvml: &Nvml, index: u32) -> Option<GpuSample> {
         vram_used_mb:      round2(vram_used_mb),
         vram_free_mb:      round2(vram_free_mb),
         vram_free_percent: round2(pct(vram_free_mb, vram_total_mb)),
-        temperature_c:     temp,
+        temperature_c:     Some(temp),
         encoder_percent,
         decoder_percent,
         power_w,
@@ -276,7 +343,7 @@ fn main() -> Result<()> {
 
     let mut networks = Networks::new_with_refreshed_list();
 
-    let gpu_monitor = GpuMonitor::init(args.no_console);
+    let mut gpu_monitor = GpuMonitor::init(args.no_console);
 
     // ── Write system_info ─────────────────────────────────────────────────────
     {
@@ -501,11 +568,13 @@ fn main() -> Result<()> {
                     |v, th| format!("GPU {} VRAM free {v:.0} MB below threshold {th:.0} MB", gpu.name),
                     ThresholdDir::Below);
 
-                check_warn_alert(&tx, MONITOR, "gpu_temp_alert",
-                    gpu.temperature_c as f64,
-                    log_cfg.gpu_temp_warn_c, log_cfg.gpu_temp_alert_c,
-                    |v, th| format!("GPU {} temperature {v:.0}°C above threshold {th:.0}°C", gpu.name),
-                    ThresholdDir::Above);
+                if let Some(temp_c) = gpu.temperature_c {
+                    check_warn_alert(&tx, MONITOR, "gpu_temp_alert",
+                        temp_c as f64,
+                        log_cfg.gpu_temp_warn_c, log_cfg.gpu_temp_alert_c,
+                        |v, th| format!("GPU {} temperature {v:.0}°C above threshold {th:.0}°C", gpu.name),
+                        ThresholdDir::Above);
+                }
 
                 if let Some(enc) = gpu.encoder_percent {
                     if let Some(th) = log_cfg.gpu_encoder_warn_percent {

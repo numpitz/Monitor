@@ -594,21 +594,62 @@ The monitor keeps polling — it never exits due to API errors.
 
 ---
 
-## GPU monitoring (NVIDIA)
+## GPU monitoring
 
-Build with `--features nvidia` to enable NVML-based GPU monitoring.
+Two backends are supported.  The monitor selects the best available one at startup
+and logs which backend is active in the `system_info` event (`gpu_monitoring` field).
 
-| Metric | Why it matters for streaming |
-|--------|------------------------------|
-| GPU utilisation % | Overall load |
-| NVENC encoder % | Hardware encoder saturation (go2rtc streams) |
-| NVDEC decoder % | Hardware decoder saturation (ffmpeg transcode) |
-| VRAM free | Running out stops hardware encoding |
-| Temperature | Thermal throttle causes frame drops |
-| Power draw | Context for thermal readings |
+### Backend 1 — NVML (NVIDIA only, highest fidelity)
+
+Build with `--features nvidia`:
+
+```powershell
+cargo build --release --features nvidia
+```
 
 NVML is part of the NVIDIA driver — no extra install required.
-AMD and Intel GPUs are listed in `system_info` but real-time metrics require their respective vendor SDKs (not yet implemented).
+
+| Metric | Available |
+|--------|-----------|
+| GPU utilisation % | ✓ |
+| Video encode % (NVENC) | ✓ |
+| Video decode % (NVDEC) | ✓ |
+| VRAM used / free / total | ✓ |
+| Temperature | ✓ |
+| Power draw | ✓ |
+
+### Backend 2 — PDH + DXGI (cross-vendor, always compiled)
+
+Automatically used when NVML is unavailable — no feature flag needed.
+Works with **NVIDIA** (without driver extras), **AMD**, and **Intel** GPUs,
+as long as a WDDM driver is installed (standard on Windows 10+).
+
+| Metric | Available |
+|--------|-----------|
+| GPU 3D engine utilisation % | ✓ (Windows PDH) |
+| Video encode % | ✓ (Windows PDH) |
+| Video decode % | ✓ (Windows PDH) |
+| VRAM used / total | ✓ (DXGI) |
+| Temperature | ✗ (vendor SDK required) |
+| Power draw | ✗ (vendor SDK required) |
+
+In the UI and log files, temperature shows `—` / is omitted when the PDH backend is active.
+
+### Startup log
+
+Check the `system_info` event at startup to confirm which backend is running:
+
+```powershell
+Get-Content C:\monitor\sys_resources.*.jsonl |
+  ConvertFrom-Json | Where-Object event -eq system_info |
+  Select-Object -Last 1 | Select-Object gpu_monitoring, gpus
+```
+
+| `gpu_monitoring` value | Meaning |
+|------------------------|---------|
+| `"nvml"` | NVIDIA NVML — full metrics |
+| `"pdh"` | Windows PDH + DXGI — cross-vendor metrics |
+| `"none"` | No GPU detected or driver missing |
 
 ---
 
