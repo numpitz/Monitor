@@ -62,6 +62,11 @@ use nvml_wrapper::{enum_wrappers::device::TemperatureSensor, Nvml};
 #[path = "../pdh_gpu.rs"]
 mod pdh_gpu;
 
+// PDH disk I/O rates — compiled on Windows.
+#[cfg(windows)]
+#[path = "../pdh_disk.rs"]
+mod pdh_disk;
+
 // ── Network drop counter ──────────────────────────────────────────────────────
 //
 // sysinfo exposes rx/tx throughput and error counts, but not packet-drop counts.
@@ -99,10 +104,6 @@ mod net_drops {
         map
     }
 
-    #[cfg(not(windows))]
-    pub fn get() -> HashMap<String, (u64, u64)> {
-        HashMap::new()
-    }
 }
 
 const MONITOR: &str = "system_monitor";
@@ -255,6 +256,22 @@ impl GpuMonitor {
     }
 }
 
+// ── Disk I/O monitor ──────────────────────────────────────────────────────────
+//
+// Two separate cfg-gated definitions so neither platform has inactive code
+// inside an active item (which would produce IDE "code is inactive" hints).
+
+struct DiskIoMonitor { pdh: Option<pdh_disk::PdhDiskMonitor> }
+
+impl DiskIoMonitor {
+    fn init() -> Self { Self { pdh: pdh_disk::PdhDiskMonitor::init() } }
+    /// Returns mount-path → (read_mb_per_sec, write_mb_per_sec).
+    fn sample(&mut self) -> HashMap<String, (f64, f64)> {
+        if let Some(pdh) = &mut self.pdh { return pdh.sample(); }
+        HashMap::new()
+    }
+}
+
 /// Sample one NVIDIA GPU by index.  Returns None if any mandatory query fails.
 #[cfg(feature = "nvidia")]
 fn sample_gpu(nvml: &Nvml, index: u32) -> Option<GpuSample> {
@@ -389,6 +406,8 @@ fn main() -> Result<()> {
 
     let mut gpu_monitor = GpuMonitor::init(args.no_console);
 
+    let mut disk_io = DiskIoMonitor::init();
+
     // ── Write system_info ─────────────────────────────────────────────────────
     {
         sys.refresh_memory();
@@ -496,17 +515,24 @@ fn main() -> Result<()> {
 
             // ── Disks ─────────────────────────────────────────────────────────
             let disks = Disks::new_with_refreshed_list();
+            let disk_io_map = disk_io.sample();
             let disk_samples: Vec<DiskSample> = if log_cfg.disk {
                 disks.list().iter()
                     .filter(|d| disk_included(&d.mount_point().to_string_lossy(), &watch_disks))
                     .map(|d| {
                         let total_gb = d.total_space()     as f64 / 1_073_741_824.0;
                         let free_gb  = d.available_space() as f64 / 1_073_741_824.0;
+                        let mount    = d.mount_point().to_string_lossy().into_owned();
+                        let (read_mb, write_mb) = disk_io_map.get(&mount)
+                            .copied()
+                            .unwrap_or((0.0, 0.0));
                         DiskSample {
-                            path:         d.mount_point().to_string_lossy().into_owned(),
-                            total_gb:     round2(total_gb),
-                            free_gb:      round2(free_gb),
-                            free_percent: round2(pct(free_gb, total_gb)),
+                            path:             mount,
+                            total_gb:         round2(total_gb),
+                            free_gb:          round2(free_gb),
+                            free_percent:     round2(pct(free_gb, total_gb)),
+                            read_mb_per_sec:  round2(read_mb),
+                            write_mb_per_sec: round2(write_mb),
                         }
                     })
                     .collect()

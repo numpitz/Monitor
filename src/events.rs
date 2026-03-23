@@ -193,11 +193,15 @@ pub struct NetworkSample {
 /// One drive entry inside a `system_resource_sample` event.
 #[derive(Serialize, Clone)]
 pub struct DiskSample {
-    pub path:         String,
-    pub total_gb:     f64,
-    pub free_gb:      f64,
+    pub path:            String,
+    pub total_gb:        f64,
+    pub free_gb:         f64,
     /// free_gb / total_gb × 100
-    pub free_percent: f64,
+    pub free_percent:    f64,
+    /// Megabytes read per second since the previous poll.
+    pub read_mb_per_sec: f64,
+    /// Megabytes written per second since the previous poll.
+    pub write_mb_per_sec: f64,
 }
 
 /// One GPU entry inside a `system_resource_sample` event.
