@@ -144,14 +144,22 @@ Edit all monitors without restarting them.
 | Process Monitor — enabled | checkbox | Monitor starts / skips on next launch |
 | Resource poll interval | 0 – 60 s | Per-process CPU / RAM sample rate (`0` = off) |
 | Snapshot interval | 0 – 600 s | Full process-tree snapshot rate (`0` = off) |
+| Response interval | 50 – 5000 ms | How quickly the monitor reacts to config changes or Ctrl-C |
 | System Monitor — enabled | checkbox | Monitor starts / skips on next launch |
 | Poll interval | 0 – 300 s | System-wide sample rate (`0` = off) |
+| Response interval | 50 – 5000 ms | How quickly the monitor reacts to config changes or Ctrl-C |
 | go2rtc Monitor — enabled | checkbox | Monitor starts / skips on next launch |
 | API URL | text field | go2rtc base URL, e.g. `http://localhost:1984` |
 | Poll interval | 0 – 300 s | Stream API poll rate (`0` = off) |
+| Response interval | 50 – 5000 ms | How quickly the monitor reacts to config changes or Ctrl-C |
 
-Setting an interval to **0** pauses that sampling block immediately — the monitor
+Setting a poll interval to **0** pauses that sampling block immediately — the monitor
 process keeps running and responds to future config changes without a restart.
+
+The **response interval** controls how finely the internal sleep loop is sliced.
+A smaller value means interval changes and Ctrl-C take effect faster; a larger
+value reduces CPU overhead from wakeups.  The default 500 ms is a good balance
+for most deployments.  The minimum enforced value is 50 ms.
 
 The **UI auto-refresh** slider (0 – 60 s) controls how often the viewer panels
 re-read the log files.  Set to `0` for manual-only refresh via the ⟳ buttons.
@@ -245,6 +253,7 @@ Settings persisted by `monitor-ui`.
 | `log_file` | `proc_resources.jsonl` | Base name for log files |
 | `resource_poll_interval_ms` | 5000 | Per-process CPU / RAM sample frequency (`0` = off) |
 | `snapshot_interval_ms` | 60000 | Full process-tree snapshot frequency (`0` = off) |
+| `min_tick_ms` | 500 | Sleep granularity — how quickly the monitor reacts to interval changes or Ctrl-C (min 50) |
 | `watch_folders` | required | Absolute paths — every `.exe` here is watched |
 | `log.cpu_alert_threshold_percent` | null | WARN when a process exceeds this CPU % |
 | `log.memory_alert_mb` | null | WARN when a process exceeds this RAM (MB) |
@@ -258,6 +267,7 @@ Settings persisted by `monitor-ui`.
 | `enabled` | `true` | Set `false` to skip on startup |
 | `log_file` | `sys_resources.jsonl` | Base name for log files |
 | `poll_interval_ms` | 30000 | How often to sample (`0` = off; 30 s recommended) |
+| `min_tick_ms` | 500 | Sleep granularity — see `process_monitor.min_tick_ms` |
 | `watch_disks` | `[]` (all) | Mount points to report, e.g. `["C:\\"]` |
 | `watch_network_interfaces` | `[]` (all) | Interface names to report, e.g. `["Ethernet"]` |
 
@@ -301,6 +311,7 @@ Disabled by default — omitting the section entirely is equivalent to `"enabled
 | `log_file` | `go2rtc_streams.jsonl` | Base name for log files |
 | `api_url` | `http://localhost:1984` | go2rtc base URL |
 | `poll_interval_ms` | 10000 | How often to poll the streams API (`0` = off) |
+| `min_tick_ms` | 500 | Sleep granularity — see `process_monitor.min_tick_ms` |
 | `log.stream_changes` | `true` | Log `stream_up` / `stream_down` on producer state changes |
 | `log.consumer_changes` | `true` | Log `consumer_change` when viewer count changes |
 | `log.stream_sample` | `true` | Log a full `stream_sample` on every poll |

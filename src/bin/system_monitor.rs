@@ -520,15 +520,22 @@ fn main() -> Result<()> {
             }
         }
 
-        // ── Sleep — fall back to 1 s when poll interval is off (0) ────────────
+        // ── Sleep — chunked so config changes and Ctrl-C take effect quickly ──
         let sleep_for = if poll_interval.is_zero() {
             Duration::from_secs(1)
         } else {
             poll_interval
         };
-        let elapsed = tick.elapsed();
-        if elapsed < sleep_for {
-            thread::sleep(sleep_for - elapsed);
+        loop {
+            let elapsed = tick.elapsed();
+            if elapsed >= sleep_for { break; }
+            if !running.load(Ordering::SeqCst) { break; }
+            let chunk = (sleep_for - elapsed).min(Duration::from_millis(sm_cfg.min_tick_ms.max(50)));
+            thread::sleep(chunk);
+            let new_cfg = config.read().monitors.system_monitor.clone();
+            if Duration::from_millis(new_cfg.poll_interval_ms) != poll_interval
+                || new_cfg.min_tick_ms != sm_cfg.min_tick_ms
+            { break; }
         }
     }
 

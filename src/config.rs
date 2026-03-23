@@ -99,6 +99,12 @@ pub struct ProcessMonitorConfig {
     #[serde(default = "default_snapshot_ms")]
     pub snapshot_interval_ms: u64,
 
+    /// Granularity of the sleep loop (milliseconds).
+    /// Controls how quickly the monitor reacts to interval changes or Ctrl-C.
+    /// Smaller = more responsive; larger = less CPU overhead. Default 500 ms.
+    #[serde(default = "default_min_tick_ms")]
+    pub min_tick_ms: u64,
+
     /// Absolute paths. Every .exe found here is watched by name.
     pub watch_folders: Vec<String>,
 
@@ -158,6 +164,10 @@ pub struct SystemMonitorConfig {
     #[serde(default = "default_sys_poll_ms")]
     pub poll_interval_ms: u64,
 
+    /// Granularity of the sleep loop — see ProcessMonitorConfig for details.
+    #[serde(default = "default_min_tick_ms")]
+    pub min_tick_ms: u64,
+
     /// Disk mount points to measure free space on (e.g. `["C:\\"]`).
     /// An empty list means *all* mounted disks are reported.
     #[serde(default)]
@@ -178,6 +188,7 @@ impl Default for SystemMonitorConfig {
             enabled:                  true,
             log_file:                 default_sys_log_file(),
             poll_interval_ms:         default_sys_poll_ms(),
+            min_tick_ms:              default_min_tick_ms(),
             watch_disks:              Vec::new(),
             watch_network_interfaces: Vec::new(),
             log:                      SystemMonitorLogConfig::default(),
@@ -329,6 +340,10 @@ pub struct Go2rtcMonitorConfig {
     #[serde(default = "default_go2rtc_poll_ms")]
     pub poll_interval_ms: u64,
 
+    /// Granularity of the sleep loop — see ProcessMonitorConfig for details.
+    #[serde(default = "default_min_tick_ms")]
+    pub min_tick_ms: u64,
+
     #[serde(default)]
     pub log: Go2rtcMonitorLogConfig,
 }
@@ -340,6 +355,7 @@ impl Default for Go2rtcMonitorConfig {
             log_file:         default_go2rtc_log_file(),
             api_url:          default_go2rtc_api_url(),
             poll_interval_ms: default_go2rtc_poll_ms(),
+            min_tick_ms:      default_min_tick_ms(),
             log:              Go2rtcMonitorLogConfig::default(),
         }
     }
@@ -368,3 +384,4 @@ impl Default for Go2rtcMonitorLogConfig {
 fn default_go2rtc_log_file() -> String { "go2rtc_streams.jsonl".into() }
 fn default_go2rtc_api_url()  -> String { "http://localhost:1984".into() }
 fn default_go2rtc_poll_ms()  -> u64    { 10_000 }
+fn default_min_tick_ms()     -> u64    { 500 }

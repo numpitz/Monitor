@@ -109,13 +109,15 @@ struct MonitorApp {
     config:  Result<Config, String>,
 
     // ── Configuration panel ───────────────────────────────────────────────────
-    proc_enabled:       bool,
-    sys_enabled:        bool,
-    proc_poll_secs:     u32,
-    proc_snapshot_secs: u32,
-    sys_poll_secs:      u32,
-    dirty:              bool,
-    status:             String,
+    proc_enabled:        bool,
+    sys_enabled:         bool,
+    proc_poll_secs:      u32,
+    proc_snapshot_secs:  u32,
+    proc_min_tick_ms:    u32,
+    sys_poll_secs:       u32,
+    sys_min_tick_ms:     u32,
+    dirty:               bool,
+    status:              String,
 
     // ── Process viewer ────────────────────────────────────────────────────────
     proc_rows:         Vec<ProcessRow>,
@@ -128,9 +130,10 @@ struct MonitorApp {
     sys_source_file:   String,
 
     // ── go2rtc config ─────────────────────────────────────────────────────────
-    go2rtc_enabled:   bool,
-    go2rtc_api_url:   String,
-    go2rtc_poll_secs: u32,
+    go2rtc_enabled:      bool,
+    go2rtc_api_url:      String,
+    go2rtc_poll_secs:    u32,
+    go2rtc_min_tick_ms:  u32,
 
     // ── go2rtc stream viewer ──────────────────────────────────────────────────
     go2rtc_stream_rows:   Vec<StreamRow>,
@@ -147,20 +150,26 @@ impl MonitorApp {
             Ok(cfg) => {
                 let proc_poll_secs     = (cfg.monitors.process_monitor.resource_poll_interval_ms / 1_000) as u32;
                 let proc_snapshot_secs = (cfg.monitors.process_monitor.snapshot_interval_ms       / 1_000) as u32;
+                let proc_min_tick_ms   = cfg.monitors.process_monitor.min_tick_ms as u32;
                 let sys_poll_secs      = (cfg.monitors.system_monitor.poll_interval_ms            / 1_000) as u32;
-                let go2rtc_poll_secs = (cfg.monitors.go2rtc_monitor.poll_interval_ms / 1_000) as u32;
-                let ui_refresh_secs  = cfg.ui.refresh_secs;
+                let sys_min_tick_ms    = cfg.monitors.system_monitor.min_tick_ms as u32;
+                let go2rtc_poll_secs   = (cfg.monitors.go2rtc_monitor.poll_interval_ms / 1_000) as u32;
+                let go2rtc_min_tick_ms = cfg.monitors.go2rtc_monitor.min_tick_ms as u32;
+                let ui_refresh_secs    = cfg.ui.refresh_secs;
                 Self {
                     log_dir,
                     proc_enabled: cfg.monitors.process_monitor.enabled,
                     sys_enabled:  cfg.monitors.system_monitor.enabled,
-                    go2rtc_enabled:  cfg.monitors.go2rtc_monitor.enabled,
-                    go2rtc_api_url:  cfg.monitors.go2rtc_monitor.api_url.clone(),
+                    go2rtc_enabled:    cfg.monitors.go2rtc_monitor.enabled,
+                    go2rtc_api_url:    cfg.monitors.go2rtc_monitor.api_url.clone(),
                     go2rtc_poll_secs,
+                    go2rtc_min_tick_ms,
                     config: Ok(cfg),
                     proc_poll_secs,
                     proc_snapshot_secs,
+                    proc_min_tick_ms,
                     sys_poll_secs,
+                    sys_min_tick_ms,
                     dirty:  false,
                     status: String::new(),
                     proc_rows:         Vec::new(),
@@ -183,9 +192,12 @@ impl MonitorApp {
                 go2rtc_enabled:     false,
                 go2rtc_api_url:     "http://localhost:1984".into(),
                 go2rtc_poll_secs:   10,
+                go2rtc_min_tick_ms: 500,
                 proc_poll_secs:     5,
                 proc_snapshot_secs: 60,
+                proc_min_tick_ms:   500,
                 sys_poll_secs:      30,
+                sys_min_tick_ms:    500,
                 dirty:  false,
                 status: String::new(),
                 proc_rows:           Vec::new(),
@@ -214,11 +226,14 @@ impl MonitorApp {
         cfg.monitors.process_monitor.enabled                    = self.proc_enabled;
         cfg.monitors.process_monitor.resource_poll_interval_ms = self.proc_poll_secs     as u64 * 1_000;
         cfg.monitors.process_monitor.snapshot_interval_ms      = self.proc_snapshot_secs as u64 * 1_000;
+        cfg.monitors.process_monitor.min_tick_ms               = self.proc_min_tick_ms   as u64;
         cfg.monitors.system_monitor.enabled                    = self.sys_enabled;
         cfg.monitors.system_monitor.poll_interval_ms           = self.sys_poll_secs      as u64 * 1_000;
+        cfg.monitors.system_monitor.min_tick_ms                = self.sys_min_tick_ms    as u64;
         cfg.monitors.go2rtc_monitor.enabled                    = self.go2rtc_enabled;
         cfg.monitors.go2rtc_monitor.api_url                    = self.go2rtc_api_url.clone();
         cfg.monitors.go2rtc_monitor.poll_interval_ms           = self.go2rtc_poll_secs   as u64 * 1_000;
+        cfg.monitors.go2rtc_monitor.min_tick_ms                = self.go2rtc_min_tick_ms as u64;
         cfg.ui.refresh_secs                                    = self.ui_refresh_secs;
 
         let json = match serde_json::to_string_pretty(&cfg) {
@@ -464,6 +479,14 @@ impl eframe::App for MonitorApp {
                             ui.label(interval_hint(self.proc_snapshot_secs));
                             if self.proc_snapshot_secs != before { self.dirty = true; self.status.clear(); }
                             ui.end_row();
+
+                            ui.label("Response interval");
+                            let before = self.proc_min_tick_ms;
+                            ui.add(egui::Slider::new(&mut self.proc_min_tick_ms, 50..=5000)
+                                .suffix(" ms").clamping(egui::SliderClamping::Always));
+                            ui.label(egui::RichText::new("config change / Ctrl-C reaction time").color(egui::Color32::GRAY).small());
+                            if self.proc_min_tick_ms != before { self.dirty = true; self.status.clear(); }
+                            ui.end_row();
                         });
                     });
                 });
@@ -493,6 +516,14 @@ impl eframe::App for MonitorApp {
                                 .suffix(" s").clamping(egui::SliderClamping::Always));
                             ui.label(interval_hint(self.sys_poll_secs));
                             if self.sys_poll_secs != before { self.dirty = true; self.status.clear(); }
+                            ui.end_row();
+
+                            ui.label("Response interval");
+                            let before = self.sys_min_tick_ms;
+                            ui.add(egui::Slider::new(&mut self.sys_min_tick_ms, 50..=5000)
+                                .suffix(" ms").clamping(egui::SliderClamping::Always));
+                            ui.label(egui::RichText::new("config change / Ctrl-C reaction time").color(egui::Color32::GRAY).small());
+                            if self.sys_min_tick_ms != before { self.dirty = true; self.status.clear(); }
                             ui.end_row();
                         });
                     });
@@ -532,6 +563,14 @@ impl eframe::App for MonitorApp {
                                 .suffix(" s").clamping(egui::SliderClamping::Always));
                             ui.label(interval_hint(self.go2rtc_poll_secs));
                             if self.go2rtc_poll_secs != before { self.dirty = true; self.status.clear(); }
+                            ui.end_row();
+
+                            ui.label("Response interval");
+                            let before = self.go2rtc_min_tick_ms;
+                            ui.add(egui::Slider::new(&mut self.go2rtc_min_tick_ms, 50..=5000)
+                                .suffix(" ms").clamping(egui::SliderClamping::Always));
+                            ui.label(egui::RichText::new("config change / Ctrl-C reaction time").color(egui::Color32::GRAY).small());
+                            if self.go2rtc_min_tick_ms != before { self.dirty = true; self.status.clear(); }
                             ui.end_row();
                         });
                     });
