@@ -202,7 +202,7 @@ Reads the latest `sys_resources.N.jsonl` and shows the last `system_resource_sam
 - **CPU** — used % and free % with a colour-coded progress bar
 - **RAM** — used / total MB and free % with a progress bar
 - **Swap** — used / total MB with a progress bar
-- **Network** — per-interface RX / TX MB/s and error count
+- **Network** — per-interface RX / TX MB/s, error count, and dropped packet count
 - **Disks** — per-mount free GB and free % with a progress bar
 - **GPU** — utilisation %, VRAM free MB, temperature °C, NVENC encoder % per card
   — **only visible when built with `--features nvidia`** (see [GPU monitoring](#gpu-monitoring-nvidia));
@@ -311,6 +311,7 @@ threshold (limit breached).  Both are optional — omit either to disable that l
 | `log.network_rx_warn_mbps` | null | Any interface RX > threshold MB/s |
 | `log.network_tx_warn_mbps` | null | Any interface TX > threshold MB/s |
 | `log.network_error_alert` | `true` | Any interface has RX or TX errors |
+| `log.network_drop_alert` | `true` | Any interface has discarded (dropped) packets |
 | `log.gpu_warn_util_percent` | 80 | GPU utilisation > 80 % |
 | `log.gpu_alert_util_percent` | 95 | GPU utilisation > 95 % |
 | `log.gpu_encoder_warn_percent` | 80 | NVENC encoder > 80 % |
@@ -518,7 +519,8 @@ Written every `poll_interval_ms`.
   "network": [
     { "interface": "Ethernet",
       "rx_mb_per_sec": 9.5, "tx_mb_per_sec": 2.1,
-      "rx_errors": 0, "tx_errors": 0 }
+      "rx_errors": 0, "tx_errors": 0,
+      "rx_dropped": 0, "tx_dropped": 0 }
   ],
   "disks": [
     { "path": "C:\\", "total_gb": 476.84, "free_gb": 210.12, "free_percent": 44.06 }
@@ -543,6 +545,7 @@ Written every `poll_interval_ms`.
 | `disk_headroom_alert` | WARN / ERROR | `disk C:\ free 8.1 GB below threshold 10 GB` |
 | `network_rx_alert` | WARN | `Ethernet RX 95.2 MB/s above threshold 80 MB/s` |
 | `network_error_alert` | ERROR | `Ethernet errors: rx=3 tx=0` |
+| `network_drop_alert` | WARN | `Ethernet dropped: rx=12 tx=0` |
 | `gpu_util_alert` | WARN / ERROR | `GPU RTX 4090 utilisation 96% above threshold 95%` |
 | `gpu_vram_alert` | WARN / ERROR | `GPU RTX 4090 VRAM free 180 MB below threshold 200 MB` |
 | `gpu_temp_alert` | WARN / ERROR | `GPU RTX 4090 temperature 91°C above threshold 90°C` |
@@ -707,4 +710,9 @@ Get-Content C:\monitor\go2rtc_streams.0.jsonl |
 # All API errors (go2rtc unreachable)
 Get-Content C:\monitor\go2rtc_streams.*.jsonl |
   ConvertFrom-Json | Where-Object event -eq api_error
+
+# Network drop alerts (packet loss on any interface)
+Get-Content C:\monitor\sys_resources.*.jsonl |
+  ConvertFrom-Json | Where-Object event -eq network_drop_alert |
+  Select-Object ts, msg
 ```

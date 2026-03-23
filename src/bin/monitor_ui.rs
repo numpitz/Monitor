@@ -62,6 +62,7 @@ struct NetRow {
     rx:        f64,
     tx:        f64,
     errors:    u64,
+    dropped:   u64,
 }
 
 struct DiskRow {
@@ -735,7 +736,7 @@ impl eframe::App for MonitorApp {
                         ui.add_space(8.0);
                         ui.label(egui::RichText::new("Network").strong());
                         egui::Grid::new("net_grid")
-                            .num_columns(4).spacing([16.0, 3.0]).striped(true)
+                            .num_columns(5).spacing([16.0, 3.0]).striped(true)
                             .show(ui, |ui| {
                                 for n in &s.network {
                                     ui.label(&n.interface);
@@ -746,6 +747,13 @@ impl eframe::App for MonitorApp {
                                             .color(egui::Color32::RED));
                                     } else {
                                         ui.label(egui::RichText::new("no errors")
+                                            .color(egui::Color32::GRAY));
+                                    }
+                                    if n.dropped > 0 {
+                                        ui.label(egui::RichText::new(format!("{} dropped", n.dropped))
+                                            .color(egui::Color32::YELLOW));
+                                    } else {
+                                        ui.label(egui::RichText::new("no drops")
                                             .color(egui::Color32::GRAY));
                                     }
                                     ui.end_row();
@@ -927,6 +935,8 @@ fn parse_sys_sample(v: &serde_json::Value) -> SysSample {
             tx:        n.get("tx_mb_per_sec").and_then(|x| x.as_f64()).unwrap_or(0.0),
             errors:    n.get("rx_errors").and_then(|x| x.as_u64()).unwrap_or(0)
                      + n.get("tx_errors").and_then(|x| x.as_u64()).unwrap_or(0),
+            dropped:   n.get("rx_dropped").and_then(|x| x.as_u64()).unwrap_or(0)
+                     + n.get("tx_dropped").and_then(|x| x.as_u64()).unwrap_or(0),
         }).collect())
         .unwrap_or_default();
 

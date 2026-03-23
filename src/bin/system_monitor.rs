@@ -33,6 +33,7 @@ use clap::Parser;
 use crossbeam_channel::bounded;
 use parking_lot::RwLock;
 use std::{
+    collections::HashMap,
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -60,6 +61,49 @@ use nvml_wrapper::{enum_wrappers::device::TemperatureSensor, Nvml};
 #[cfg(windows)]
 #[path = "../pdh_gpu.rs"]
 mod pdh_gpu;
+
+// ── Network drop counter ──────────────────────────────────────────────────────
+//
+// sysinfo exposes rx/tx throughput and error counts, but not packet-drop counts.
+// We read MIB_IF_ROW2 directly via GetIfTable2 (iphlpapi), which contains
+// InDiscards / OutDiscards — the same source sysinfo uses for interface names
+// (the `Alias` wide-string field), so the names match perfectly.
+
+mod net_drops {
+    use std::collections::HashMap;
+
+    /// Returns a map of interface alias → (in_discards, out_discards).
+    #[cfg(windows)]
+    pub fn get() -> HashMap<String, (u64, u64)> {
+        use windows::Win32::NetworkManagement::IpHelper::{FreeMibTable, GetIfTable2, MIB_IF_TABLE2};
+        let mut map = HashMap::new();
+        unsafe {
+            let mut table_ptr: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
+            if GetIfTable2(&mut table_ptr).is_err() || table_ptr.is_null() {
+                return map;
+            }
+            let num = (*table_ptr).NumEntries as usize;
+            // The Table field is declared as [MIB_IF_ROW2; 1] but the kernel
+            // allocates `NumEntries` rows contiguously — use a raw pointer walk.
+            let row_ptr = (*table_ptr).Table.as_ptr();
+            for i in 0..num {
+                let row = &*row_ptr.add(i);
+                // Alias is the friendly name ("Ethernet", "Wi-Fi", …).
+                let alias_end = row.Alias.iter().position(|&c| c == 0).unwrap_or(row.Alias.len());
+                if let Ok(name) = String::from_utf16(&row.Alias[..alias_end]) {
+                    map.insert(name, (row.InDiscards, row.OutDiscards));
+                }
+            }
+            FreeMibTable(table_ptr as *const _);
+        }
+        map
+    }
+
+    #[cfg(not(windows))]
+    pub fn get() -> HashMap<String, (u64, u64)> {
+        HashMap::new()
+    }
+}
 
 const MONITOR: &str = "system_monitor";
 
@@ -426,15 +470,24 @@ fn main() -> Result<()> {
 
             // ── Network ───────────────────────────────────────────────────────
             networks.refresh();
+            let drop_map = network_drop_counts();
+
             let net_samples: Vec<NetworkSample> = if log_cfg.network {
                 networks.iter()
                     .filter(|(name, _)| iface_included(name, &watch_ifaces))
-                    .map(|(name, data)| NetworkSample {
-                        interface:     name.clone(),
-                        rx_mb_per_sec: round2(data.received()    as f64 / 1_048_576.0 / elapsed_secs),
-                        tx_mb_per_sec: round2(data.transmitted() as f64 / 1_048_576.0 / elapsed_secs),
-                        rx_errors:     data.errors_on_received(),
-                        tx_errors:     data.errors_on_transmitted(),
+                    .map(|(name, data)| {
+                        let (rx_dropped, tx_dropped) = drop_map.get(name.as_str())
+                            .copied()
+                            .unwrap_or((0, 0));
+                        NetworkSample {
+                            interface:     name.clone(),
+                            rx_mb_per_sec: round2(data.received()    as f64 / 1_048_576.0 / elapsed_secs),
+                            tx_mb_per_sec: round2(data.transmitted() as f64 / 1_048_576.0 / elapsed_secs),
+                            rx_errors:     data.errors_on_received(),
+                            tx_errors:     data.errors_on_transmitted(),
+                            rx_dropped,
+                            tx_dropped,
+                        }
                     })
                     .collect()
             } else {
@@ -553,6 +606,16 @@ fn main() -> Result<()> {
                     }
                 }
             }
+            if log_cfg.network_drop_alert {
+                for n in &net_samples {
+                    if n.rx_dropped > 0 || n.tx_dropped > 0 {
+                        send(&tx, &LogEntry::warn(MONITOR, "network_drop_alert", WarningData {
+                            msg: format!("{} dropped: rx={} tx={}", n.interface, n.rx_dropped, n.tx_dropped),
+                            detail: None,
+                        }));
+                    }
+                }
+            }
 
             // ── GPU alerts ────────────────────────────────────────────────────
             for gpu in &gpu_samples {
@@ -617,6 +680,11 @@ fn main() -> Result<()> {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Returns interface alias → (in_discards, out_discards).
+fn network_drop_counts() -> HashMap<String, (u64, u64)> {
+    net_drops::get()
+}
 
 fn round2(v: f64) -> f64 { (v * 100.0).round() / 100.0 }
 

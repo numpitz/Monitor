@@ -251,6 +251,8 @@ pub struct SystemMonitorLogConfig {
     #[serde(default)] pub network_tx_warn_mbps: Option<f64>,
     /// Emit an ERROR alert when any interface has receive or transmit errors.
     #[serde(default = "yes")] pub network_error_alert: bool,
+    /// Emit a WARN alert when any interface has received or transmitted dropped packets.
+    #[serde(default = "yes")] pub network_drop_alert: bool,
 
     // ── GPU thresholds (NVIDIA NVML only) ─────────────────────────────────────
     /// Log GPU metrics (requires `nvidia` feature flag at build time).
@@ -299,6 +301,7 @@ impl Default for SystemMonitorLogConfig {
             network_rx_warn_mbps:  None,
             network_tx_warn_mbps:  None,
             network_error_alert:   true,
+            network_drop_alert:    true,
 
             gpu:                      true,
             gpu_warn_util_percent:    Some(80.0),

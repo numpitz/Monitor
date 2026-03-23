@@ -184,6 +184,10 @@ pub struct NetworkSample {
     pub rx_errors:        u64,
     /// Cumulative transmit errors on this interface.
     pub tx_errors:        u64,
+    /// Cumulative inbound packets discarded (buffer overflow / no route).
+    pub rx_dropped:       u64,
+    /// Cumulative outbound packets discarded (buffer overflow / congestion).
+    pub tx_dropped:       u64,
 }
 
 /// One drive entry inside a `system_resource_sample` event.
