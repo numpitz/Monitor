@@ -204,7 +204,9 @@ Reads the latest `sys_resources.N.jsonl` and shows the last `system_resource_sam
 - **Swap** — used / total MB with a progress bar
 - **Network** — per-interface RX / TX MB/s and error count
 - **Disks** — per-mount free GB and free % with a progress bar
-- **GPU** — utilisation, VRAM free, temperature, NVENC encoder % (when available)
+- **GPU** — utilisation %, VRAM free MB, temperature °C, NVENC encoder % per card
+  — **only visible when built with `--features nvidia`** (see [GPU monitoring](#gpu-monitoring-nvidia));
+  the section is hidden entirely when the log contains no GPU data
 
 Progress bars are green / yellow / red based on the default alert thresholds.
 
