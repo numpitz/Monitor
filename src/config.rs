@@ -15,8 +15,28 @@ pub struct Config {
     #[serde(default)]
     pub log_rotation: LogRotationConfig,
 
+    #[serde(default)]
+    pub ui: UiConfig,
+
     pub monitors: MonitorsConfig,
 }
+
+// ── UI settings ───────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct UiConfig {
+    /// How often monitor-ui re-reads log files (seconds). `0` = manual only.
+    #[serde(default = "default_ui_refresh_secs")]
+    pub refresh_secs: u32,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self { refresh_secs: default_ui_refresh_secs() }
+    }
+}
+
+fn default_ui_refresh_secs() -> u32 { 5 }
 
 impl Config {
     pub fn load(log_dir: &Path) -> Result<Self> {

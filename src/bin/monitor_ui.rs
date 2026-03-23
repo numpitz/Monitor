@@ -3,10 +3,11 @@
 //! Usage:
 //!   monitor-ui.exe <LOG_DIR>
 //!
-//! Three panels:
-//!   1. Configuration  — edit poll intervals and enabled flags for both monitors
+//! Panels:
+//!   1. Configuration  — edit poll intervals and enabled flags for all monitors
 //!   2. Watched Processes — live table rebuilt from proc_resources.N.jsonl
 //!   3. System Resources  — last sample from sys_resources.N.jsonl with progress bars
+//!   4. go2rtc Streams    — last stream_sample from go2rtc_streams.N.jsonl
 
 use eframe::egui;
 use process_monitor::config::Config;
@@ -93,6 +94,14 @@ struct SysSample {
     gpus:                Vec<GpuRow>,
 }
 
+struct StreamRow {
+    name:            String,
+    producer_active: bool,
+    producer_url:    String,
+    consumer_count:  u32,
+    ts:              String,
+}
+
 // ── App state ─────────────────────────────────────────────────────────────────
 
 struct MonitorApp {
@@ -118,11 +127,19 @@ struct MonitorApp {
     sys_last_refresh:  Option<Instant>,
     sys_source_file:   String,
 
+    // ── go2rtc config ─────────────────────────────────────────────────────────
+    go2rtc_enabled:   bool,
+    go2rtc_api_url:   String,
+    go2rtc_poll_secs: u32,
+
+    // ── go2rtc stream viewer ──────────────────────────────────────────────────
+    go2rtc_stream_rows:   Vec<StreamRow>,
+    go2rtc_last_refresh:  Option<Instant>,
+    go2rtc_source_file:   String,
+
     /// How often the UI re-reads the log files (seconds). 0 = manual only.
     ui_refresh_secs: u32,
 }
-
-const DEFAULT_UI_REFRESH_SECS: u32 = 5;
 
 impl MonitorApp {
     fn load(log_dir: PathBuf) -> Self {
@@ -131,23 +148,31 @@ impl MonitorApp {
                 let proc_poll_secs     = (cfg.monitors.process_monitor.resource_poll_interval_ms / 1_000) as u32;
                 let proc_snapshot_secs = (cfg.monitors.process_monitor.snapshot_interval_ms       / 1_000) as u32;
                 let sys_poll_secs      = (cfg.monitors.system_monitor.poll_interval_ms            / 1_000) as u32;
+                let go2rtc_poll_secs = (cfg.monitors.go2rtc_monitor.poll_interval_ms / 1_000) as u32;
+                let ui_refresh_secs  = cfg.ui.refresh_secs;
                 Self {
                     log_dir,
                     proc_enabled: cfg.monitors.process_monitor.enabled,
                     sys_enabled:  cfg.monitors.system_monitor.enabled,
+                    go2rtc_enabled:  cfg.monitors.go2rtc_monitor.enabled,
+                    go2rtc_api_url:  cfg.monitors.go2rtc_monitor.api_url.clone(),
+                    go2rtc_poll_secs,
                     config: Ok(cfg),
                     proc_poll_secs,
                     proc_snapshot_secs,
                     sys_poll_secs,
                     dirty:  false,
                     status: String::new(),
-                    proc_rows:        Vec::new(),
+                    proc_rows:         Vec::new(),
                     proc_last_refresh: None,
                     proc_source_file:  String::new(),
                     sys_sample:        None,
                     sys_last_refresh:  None,
                     sys_source_file:   String::new(),
-                    ui_refresh_secs:   DEFAULT_UI_REFRESH_SECS,
+                    go2rtc_stream_rows:  Vec::new(),
+                    go2rtc_last_refresh: None,
+                    go2rtc_source_file:  String::new(),
+                    ui_refresh_secs,
                 }
             }
             Err(e) => Self {
@@ -155,22 +180,29 @@ impl MonitorApp {
                 config: Err(e.to_string()),
                 proc_enabled:       true,
                 sys_enabled:        true,
+                go2rtc_enabled:     false,
+                go2rtc_api_url:     "http://localhost:1984".into(),
+                go2rtc_poll_secs:   10,
                 proc_poll_secs:     5,
                 proc_snapshot_secs: 60,
                 sys_poll_secs:      30,
                 dirty:  false,
                 status: String::new(),
-                proc_rows:         Vec::new(),
-                proc_last_refresh: None,
-                proc_source_file:  String::new(),
-                sys_sample:        None,
-                sys_last_refresh:  None,
-                sys_source_file:   String::new(),
-                ui_refresh_secs:   DEFAULT_UI_REFRESH_SECS,
+                proc_rows:           Vec::new(),
+                proc_last_refresh:   None,
+                proc_source_file:    String::new(),
+                sys_sample:          None,
+                sys_last_refresh:    None,
+                sys_source_file:     String::new(),
+                go2rtc_stream_rows:  Vec::new(),
+                go2rtc_last_refresh: None,
+                go2rtc_source_file:  String::new(),
+                ui_refresh_secs:     5,
             },
         };
         app.refresh_processes();
         app.refresh_system();
+        app.refresh_streams();
         app
     }
 
@@ -184,6 +216,10 @@ impl MonitorApp {
         cfg.monitors.process_monitor.snapshot_interval_ms      = self.proc_snapshot_secs as u64 * 1_000;
         cfg.monitors.system_monitor.enabled                    = self.sys_enabled;
         cfg.monitors.system_monitor.poll_interval_ms           = self.sys_poll_secs      as u64 * 1_000;
+        cfg.monitors.go2rtc_monitor.enabled                    = self.go2rtc_enabled;
+        cfg.monitors.go2rtc_monitor.api_url                    = self.go2rtc_api_url.clone();
+        cfg.monitors.go2rtc_monitor.poll_interval_ms           = self.go2rtc_poll_secs   as u64 * 1_000;
+        cfg.ui.refresh_secs                                    = self.ui_refresh_secs;
 
         let json = match serde_json::to_string_pretty(&cfg) {
             Ok(j)  => j,
@@ -311,19 +347,73 @@ impl MonitorApp {
         self.sys_last_refresh = Some(Instant::now());
         self.sys_source_file  = log_path.file_name().unwrap_or_default().to_string_lossy().into_owned();
     }
+
+    /// Read the last `stream_sample` event from the go2rtc_streams log file.
+    fn refresh_streams(&mut self) {
+        let base = match &self.config {
+            Ok(cfg) => cfg.monitors.go2rtc_monitor.log_file.clone(),
+            Err(_)  => "go2rtc_streams.jsonl".to_string(),
+        };
+        let log_path = match find_latest_log(&self.log_dir, &base) {
+            Some(p) => p,
+            None => {
+                self.go2rtc_source_file  = "no log file found".into();
+                self.go2rtc_last_refresh = Some(Instant::now());
+                return;
+            }
+        };
+        let content = match std::fs::read_to_string(&log_path) {
+            Ok(c)  => c,
+            Err(e) => {
+                self.go2rtc_source_file  = format!("read error: {e}");
+                self.go2rtc_last_refresh = Some(Instant::now());
+                return;
+            }
+        };
+
+        // Keep only the last stream_sample event.
+        let mut last: Option<serde_json::Value> = None;
+        for line in content.lines() {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                if v.get("event").and_then(|e| e.as_str()) == Some("stream_sample") {
+                    last = Some(v);
+                }
+            }
+        }
+
+        self.go2rtc_stream_rows = if let Some(ref v) = last {
+            let ts = ts_time(v);
+            v.get("streams").and_then(|s| s.as_array())
+                .map(|arr| arr.iter().map(|s| StreamRow {
+                    name:            val_str(s, "name"),
+                    producer_active: s.get("producer_active").and_then(|x| x.as_bool()).unwrap_or(false),
+                    producer_url:    val_str(s, "producer_url"),
+                    consumer_count:  s.get("consumer_count").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
+                    ts:              ts.clone(),
+                }).collect())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        self.go2rtc_last_refresh = Some(Instant::now());
+        self.go2rtc_source_file  = log_path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+    }
 }
 
 // ── egui render loop ──────────────────────────────────────────────────────────
 
 impl eframe::App for MonitorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Auto-refresh both viewers when the interval is active (> 0).
+        // Auto-refresh all viewers when the interval is active (> 0).
         if self.ui_refresh_secs > 0 {
-            let interval = Duration::from_secs(self.ui_refresh_secs as u64);
-            let proc_due = self.proc_last_refresh.map_or(true, |t| t.elapsed() >= interval);
-            let sys_due  = self.sys_last_refresh .map_or(true, |t| t.elapsed() >= interval);
-            if proc_due { self.refresh_processes(); }
-            if sys_due  { self.refresh_system(); }
+            let interval    = Duration::from_secs(self.ui_refresh_secs as u64);
+            let proc_due    = self.proc_last_refresh   .map_or(true, |t| t.elapsed() >= interval);
+            let sys_due     = self.sys_last_refresh    .map_or(true, |t| t.elapsed() >= interval);
+            let streams_due = self.go2rtc_last_refresh .map_or(true, |t| t.elapsed() >= interval);
+            if proc_due    { self.refresh_processes(); }
+            if sys_due     { self.refresh_system(); }
+            if streams_due { self.refresh_streams(); }
             ctx.request_repaint_after(interval);
         }
 
@@ -408,6 +498,45 @@ impl eframe::App for MonitorApp {
                     });
                 });
 
+                ui.add_space(10.0);
+
+                // ── go2rtc Monitor config ──────────────────────────────────────
+                ui.group(|ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        let before = self.go2rtc_enabled;
+                        ui.checkbox(&mut self.go2rtc_enabled, egui::RichText::new("go2rtc Monitor").strong());
+                        if self.go2rtc_enabled != before { self.dirty = true; self.status.clear(); }
+                        if !self.go2rtc_enabled {
+                            ui.colored_label(egui::Color32::YELLOW, "  disabled — monitor will not start");
+                        }
+                    });
+                    ui.separator();
+                    ui.add_enabled_ui(self.go2rtc_enabled, |ui| {
+                        egui::Grid::new("go2rtc_grid")
+                            .num_columns(3)
+                            .spacing([12.0, 8.0])
+                            .show(ui, |ui| {
+                            ui.label("API URL");
+                            let before = self.go2rtc_api_url.clone();
+                            ui.add(egui::TextEdit::singleline(&mut self.go2rtc_api_url)
+                                .desired_width(260.0)
+                                .hint_text("http://localhost:1984"));
+                            ui.label(egui::RichText::new("base URL of go2rtc").color(egui::Color32::GRAY).small());
+                            if self.go2rtc_api_url != before { self.dirty = true; self.status.clear(); }
+                            ui.end_row();
+
+                            ui.label("Poll interval");
+                            let before = self.go2rtc_poll_secs;
+                            ui.add(egui::Slider::new(&mut self.go2rtc_poll_secs, 0..=300)
+                                .suffix(" s").clamping(egui::SliderClamping::Always));
+                            ui.label(interval_hint(self.go2rtc_poll_secs));
+                            if self.go2rtc_poll_secs != before { self.dirty = true; self.status.clear(); }
+                            ui.end_row();
+                        });
+                    });
+                });
+
                 ui.add_space(16.0);
 
                 // ── Save button ────────────────────────────────────────────────
@@ -425,12 +554,13 @@ impl eframe::App for MonitorApp {
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     ui.label("UI auto-refresh");
+                    let before = self.ui_refresh_secs;
                     ui.add(egui::Slider::new(&mut self.ui_refresh_secs, 0..=60)
                         .suffix(" s")
                         .clamping(egui::SliderClamping::Always));
-                    ui.label(egui::RichText::new(
-                        if self.ui_refresh_secs == 0 { "manual only" } else { "interval" }
-                    ).color(egui::Color32::GRAY).small());
+                    ui.label(egui::RichText::new(interval_hint(self.ui_refresh_secs))
+                        .color(egui::Color32::GRAY).small());
+                    if self.ui_refresh_secs != before { self.dirty = true; self.status.clear(); }
                 });
 
                 // ── Watched Processes viewer ───────────────────────────────────
@@ -631,6 +761,64 @@ impl eframe::App for MonitorApp {
                                 }
                             });
                     }
+                }
+
+                // ── go2rtc Streams viewer ──────────────────────────────────────
+                ui.add_space(16.0);
+                ui.separator();
+                ui.add_space(8.0);
+
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("go2rtc Streams").strong());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("⟳  Refresh").clicked() {
+                            self.refresh_streams();
+                        }
+                        if !self.go2rtc_source_file.is_empty() {
+                            ui.label(egui::RichText::new(&self.go2rtc_source_file)
+                                .small().color(egui::Color32::GRAY));
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+
+                if self.go2rtc_stream_rows.is_empty() {
+                    ui.label(egui::RichText::new("No stream data — is go2rtc-monitor running?")
+                        .color(egui::Color32::GRAY));
+                } else {
+                    egui::Grid::new("stream_header")
+                        .num_columns(4).spacing([12.0, 2.0])
+                        .show(ui, |ui| {
+                            for label in ["Name", "Status", "Consumers", "Last seen"] {
+                                ui.label(egui::RichText::new(label).strong().small());
+                            }
+                            ui.end_row();
+                        });
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .id_salt("stream_scroll")
+                        .max_height(180.0)
+                        .show(ui, |ui| {
+                            egui::Grid::new("stream_table")
+                                .num_columns(4).spacing([12.0, 4.0]).striped(true)
+                                .show(ui, |ui| {
+                                    for row in &self.go2rtc_stream_rows {
+                                        ui.label(&row.name);
+                                        if row.producer_active {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(80, 180, 80),
+                                                "Active",
+                                            );
+                                        } else {
+                                            ui.colored_label(egui::Color32::GRAY, "Inactive");
+                                        }
+                                        ui.label(row.consumer_count.to_string());
+                                        ui.label(egui::RichText::new(&row.ts)
+                                            .small().color(egui::Color32::GRAY));
+                                        ui.end_row();
+                                    }
+                                });
+                        });
                 }
             }); // ScrollArea
         }); // CentralPanel
