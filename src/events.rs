@@ -267,6 +267,26 @@ pub struct SystemResourceSampleData {
     pub gpus: Vec<GpuSample>,
 }
 
+// ── monitor-watchdog event data ───────────────────────────────────────────────
+
+/// A child monitor process was started or restarted.
+#[derive(Serialize)]
+pub struct ChildStartedData {
+    pub name:          String,
+    pub pid:           u32,
+    /// 0 on first start; increments on every restart.
+    pub restart_count: u32,
+}
+
+/// A child monitor process exited unexpectedly.
+#[derive(Serialize)]
+pub struct ChildExitedData {
+    pub name:           String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code:      Option<i32>,
+    pub uptime_seconds: u64,
+}
+
 // ── go2rtc-monitor event data ─────────────────────────────────────────────────
 
 /// One stream entry inside a `stream_sample` event.

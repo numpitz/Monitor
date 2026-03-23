@@ -25,6 +25,10 @@ path = "src/bin/monitor_ui.rs"
 name = "go2rtc-monitor"
 path = "src/bin/go2rtc_monitor.rs"
 
+[[bin]]
+name = "monitor-watchdog"
+path = "src/bin/monitor_watchdog.rs"
+
 # ── cross-platform deps ───────────────────────────────────────────────────────
 [dependencies]
 anyhow               = "1"

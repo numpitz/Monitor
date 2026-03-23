@@ -1,14 +1,15 @@
 # Monitor Suite
 
-Rust 2024 · Windows 10+ · four standalone `.exe` files
+Rust 2024 · Windows 10+ · five standalone `.exe` files
 
 A lightweight monitoring suite for video-streaming servers running **go2rtc** and **ffmpeg**.
-All four binaries share one `monitor.config.json` and write their own NDJSON log files.
+All binaries share one `monitor.config.json` and write their own NDJSON log files.
 
 | Binary | Purpose | Log file |
 |--------|---------|----------|
+| `monitor-watchdog.exe` | Supervisor — starts, watches, and restarts all monitors | `watchdog.jsonl` |
 | `process-monitor.exe` | Per-process CPU, RAM, handles, spawn/exit events | `proc_resources.jsonl` |
-| `system-monitor.exe` | System-wide free CPU, RAM, swap, disk, network, GPU | `sys_resources.jsonl` |
+| `system-monitor.exe` | System-wide CPU, RAM, swap, disk, network, GPU | `sys_resources.jsonl` |
 | `go2rtc-monitor.exe` | go2rtc stream state — producers, consumers, up/down events | `go2rtc_streams.jsonl` |
 | `monitor-ui.exe` | egui desktop app — live config editor and resource viewer | — |
 
@@ -30,6 +31,7 @@ cargo build --release --features nvidia
 Outputs in `target\release\` (or `target\debug\`):
 
 ```
+monitor-watchdog.exe
 process-monitor.exe
 system-monitor.exe
 go2rtc-monitor.exe
@@ -45,18 +47,42 @@ No runtime dependencies — each ships as a single file.
 All binaries take the same first argument: the directory that contains
 `monitor.config.json`.  Log files are also written there.
 
+### Recommended: run everything through the watchdog
+
 ```powershell
-# Monitors — with console window
+# Start all enabled monitors and keep them alive
+monitor-watchdog.exe C:\monitor\
+
+# Same, but detached — no console window
+monitor-watchdog.exe C:\monitor\ --no-console
+```
+
+The watchdog starts every monitor that is `"enabled": true` in the config,
+monitors them every 500 ms, and restarts any that exit unexpectedly within 3 s.
+Closing (or Ctrl-C) the watchdog stops all child monitors cleanly.
+
+If a monitor is **disabled** in the config while the watchdog is running, the
+watchdog kills that child and does not restart it.  If a monitor is **enabled**
+in the config while the watchdog is running, the watchdog starts it on the next
+tick — no restart of the watchdog required.
+
+### Run monitors individually (advanced)
+
+```powershell
+# With console window
 process-monitor.exe C:\monitor\
 system-monitor.exe  C:\monitor\
 go2rtc-monitor.exe  C:\monitor\
 
-# Monitors — detached, no window (background / supervisor mode)
+# Detached, no window
 process-monitor.exe C:\monitor\ --no-console
 system-monitor.exe  C:\monitor\ --no-console
 go2rtc-monitor.exe  C:\monitor\ --no-console
+```
 
-# Configuration UI
+### Configuration UI
+
+```powershell
 monitor-ui.exe C:\monitor\
 ```
 
@@ -67,9 +93,34 @@ via their built-in config-watcher — **no restart required**.
 
 ---
 
+## monitor-watchdog
+
+The watchdog is the single entry point for production deployments.
+
+### Behaviour summary
+
+| Situation | Watchdog action |
+|-----------|-----------------|
+| Monitor enabled in config | Start on next tick (500 ms) |
+| Monitor exits unexpectedly | Log `child_exited`, restart after 3 s |
+| Monitor disabled in config while running | Kill immediately, do not restart |
+| Spawn fails (binary not found, etc.) | Log `child_start_failed`, retry after 3 s |
+| Watchdog receives Ctrl-C / SIGTERM | Kill all children, drain log, exit 0 |
+
+### Watchdog log events
+
+| Event | Level | Description |
+|-------|-------|-------------|
+| `child_started` | INFO | A monitor was started for the first time |
+| `child_restarted` | INFO | A monitor was restarted after an unexpected exit |
+| `child_exited` | WARN | A monitor exited (includes `exit_code` and `uptime_seconds`) |
+| `child_start_failed` | ERROR | Could not spawn the binary |
+
+---
+
 ## monitor-ui
 
-The UI has two panels.
+The UI has four panels.
 
 ### Configuration panel
 
@@ -110,6 +161,19 @@ of all watched processes.
 Alive processes are shown in white.  Processes that have exited appear dimmed in
 grey with `—` for metrics and the exit time in **Last seen**.
 
+### go2rtc Streams panel
+
+Reads the latest `go2rtc_streams.N.jsonl` and shows the last `stream_sample`.
+
+| Column | Description |
+|--------|-------------|
+| Name | Stream name as configured in go2rtc |
+| Status | **Active** (green) or **Inactive** (grey) |
+| Consumers | Number of current viewers |
+| Last seen | `HH:MM:SS` of the last `stream_sample` that included this stream |
+
+Hovering over a stream name shows the producer URL (e.g. the RTSP source address).
+
 ### System Resources panel
 
 Reads the latest `sys_resources.N.jsonl` and shows the last `system_resource_sample`:
@@ -127,11 +191,12 @@ Progress bars are green / yellow / red based on the default alert thresholds.
 
 ## Config (`monitor.config.json`)
 
-All four binaries read the same file.
+All binaries read the same file.
 
 ```json
 {
   "log_rotation": { ... },
+  "ui": { ... },
   "monitors": {
     "process_monitor": { ... },
     "system_monitor":  { ... },
@@ -146,6 +211,16 @@ All four binaries read the same file.
 |-----|---------|-------------|
 | `max_file_size_mb` | 10 | Rotate when the active log file exceeds this size |
 | `keep_files` | 5 | Number of rotated files to keep |
+
+---
+
+### `ui`
+
+Settings persisted by `monitor-ui`.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `refresh_secs` | 5 | How often the UI re-reads log files (`0` = manual ⟳ only) |
 
 ---
 
@@ -247,6 +322,9 @@ Full example with custom URL and logging options:
 Each monitor uses numbered rotation independently:
 
 ```
+watchdog.0.jsonl           ← oldest
+watchdog.1.jsonl           ← active
+
 proc_resources.0.jsonl     ← oldest
 proc_resources.1.jsonl
 proc_resources.2.jsonl     ← active
@@ -269,7 +347,7 @@ All events share the same envelope:
 ```json
 {
   "ts":      "2026-03-23T10:00:00.000Z",
-  "monitor": "process_monitor | system_monitor | go2rtc_monitor",
+  "monitor": "monitor_watchdog | process_monitor | system_monitor | go2rtc_monitor",
   "event":   "<event_name>",
   "level":   "INFO | WARN | ERROR",
   "...":     "event-specific fields"
@@ -293,6 +371,34 @@ All events share the same envelope:
 #### `config_reloaded`
 ```json
 { "path": "C:\\monitor\\monitor.config.json" }
+```
+
+---
+
+### monitor-watchdog events
+
+#### `child_started`
+Emitted when a monitor is launched for the first time.
+```json
+{ "name": "process-monitor", "pid": 5120, "restart_count": 0 }
+```
+
+#### `child_restarted`
+Emitted when a monitor is restarted after an unexpected exit.
+```json
+{ "name": "process-monitor", "pid": 5244, "restart_count": 1 }
+```
+
+#### `child_exited`
+Emitted at WARN level when a monitor exits unexpectedly.
+```json
+{ "name": "process-monitor", "exit_code": 1, "uptime_seconds": 3724 }
+```
+
+#### `child_start_failed`
+Emitted at ERROR level when the binary cannot be spawned (e.g. file not found).
+```json
+{ "msg": "failed to start process-monitor", "detail": "No such file or directory (os error 2)" }
 ```
 
 ---
@@ -465,6 +571,11 @@ AMD and Intel GPUs are listed in `system_info` but real-time metrics require the
 ## Grep examples
 
 ```powershell
+# Watchdog restart history — how often did each monitor need a restart?
+Get-Content C:\monitor\watchdog.*.jsonl |
+  ConvertFrom-Json | Where-Object event -eq child_restarted |
+  Select-Object ts, name, restart_count
+
 # All WARN and ERROR entries across all monitors
 Get-ChildItem C:\monitor\*.jsonl | Get-Content |
   ConvertFrom-Json | Where-Object level -ne INFO
