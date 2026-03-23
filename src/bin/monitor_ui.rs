@@ -803,7 +803,10 @@ impl eframe::App for MonitorApp {
                                 .num_columns(4).spacing([12.0, 4.0]).striped(true)
                                 .show(ui, |ui| {
                                     for row in &self.go2rtc_stream_rows {
-                                        ui.label(&row.name);
+                                        let name_label = ui.label(&row.name);
+                                        if !row.producer_url.is_empty() {
+                                            name_label.on_hover_text(&row.producer_url);
+                                        }
                                         if row.producer_active {
                                             ui.colored_label(
                                                 egui::Color32::from_rgb(80, 180, 80),

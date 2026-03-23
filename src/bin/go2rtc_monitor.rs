@@ -276,7 +276,7 @@ fn poll_streams(
                 } else if prev.producer_active && !producer_active && log_cfg.stream_changes {
                     send(tx, &LogEntry::warn(MONITOR, "stream_down", StreamStateChangeData {
                         name:         name.clone(),
-                        producer_url: producer_url.clone(),
+                        producer_url: prev.producer_url.clone(), // last-known active URL
                     }));
                 }
                 if prev.consumer_count != consumer_count && log_cfg.consumer_changes {
