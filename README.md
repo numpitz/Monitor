@@ -1,15 +1,16 @@
 # Monitor Suite
 
-Rust 2024 · Windows 10+ · three standalone `.exe` files
+Rust 2024 · Windows 10+ · four standalone `.exe` files
 
 A lightweight monitoring suite for video-streaming servers running **go2rtc** and **ffmpeg**.
-All three binaries share one `monitor.config.json` and write their own NDJSON log files.
+All four binaries share one `monitor.config.json` and write their own NDJSON log files.
 
 | Binary | Purpose | Log file |
 |--------|---------|----------|
 | `process-monitor.exe` | Per-process CPU, RAM, handles, spawn/exit events | `proc_resources.jsonl` |
 | `system-monitor.exe` | System-wide free CPU, RAM, swap, disk, network, GPU | `sys_resources.jsonl` |
-| `monitor-ui.exe` | egui desktop app — live config editor and process viewer | — |
+| `go2rtc-monitor.exe` | go2rtc stream state — producers, consumers, up/down events | `go2rtc_streams.jsonl` |
+| `monitor-ui.exe` | egui desktop app — live config editor and resource viewer | — |
 
 ---
 
@@ -31,6 +32,7 @@ Outputs in `target\release\` (or `target\debug\`):
 ```
 process-monitor.exe
 system-monitor.exe
+go2rtc-monitor.exe
 monitor-ui.exe
 ```
 
@@ -47,10 +49,12 @@ All binaries take the same first argument: the directory that contains
 # Monitors — with console window
 process-monitor.exe C:\monitor\
 system-monitor.exe  C:\monitor\
+go2rtc-monitor.exe  C:\monitor\
 
 # Monitors — detached, no window (background / supervisor mode)
 process-monitor.exe C:\monitor\ --no-console
 system-monitor.exe  C:\monitor\ --no-console
+go2rtc-monitor.exe  C:\monitor\ --no-console
 
 # Configuration UI
 monitor-ui.exe C:\monitor\
@@ -58,7 +62,7 @@ monitor-ui.exe C:\monitor\
 
 ### Live configuration
 
-The UI writes changes atomically.  Both monitors pick them up within ~400 ms
+The UI writes changes atomically.  All monitors pick them up within ~400 ms
 via their built-in config-watcher — **no restart required**.
 
 ---
@@ -69,7 +73,7 @@ The UI has two panels.
 
 ### Configuration panel
 
-Edit both monitors without restarting them.
+Edit all monitors without restarting them.
 
 | Control | Range | Effect when saved |
 |---------|-------|-------------------|
@@ -78,15 +82,20 @@ Edit both monitors without restarting them.
 | Snapshot interval | 0 – 600 s | Full process-tree snapshot rate (`0` = off) |
 | System Monitor — enabled | checkbox | Monitor starts / skips on next launch |
 | Poll interval | 0 – 300 s | System-wide sample rate (`0` = off) |
+| go2rtc Monitor — enabled | checkbox | Monitor starts / skips on next launch |
+| API URL | text field | go2rtc base URL, e.g. `http://localhost:1984` |
+| Poll interval | 0 – 300 s | Stream API poll rate (`0` = off) |
 
 Setting an interval to **0** pauses that sampling block immediately — the monitor
 process keeps running and responds to future config changes without a restart.
 
+The **UI auto-refresh** slider (0 – 60 s) controls how often the viewer panels
+re-read the log files.  Set to `0` for manual-only refresh via the ⟳ buttons.
+
 ### Process viewer panel
 
 Reads the latest `proc_resources.N.jsonl` log file and shows the current state
-of all watched processes.  Refreshes automatically every **5 seconds**; a manual
-**⟳ Refresh** button is available in the panel header.
+of all watched processes.
 
 | Column | Description |
 |--------|-------------|
@@ -101,18 +110,32 @@ of all watched processes.  Refreshes automatically every **5 seconds**; a manual
 Alive processes are shown in white.  Processes that have exited appear dimmed in
 grey with `—` for metrics and the exit time in **Last seen**.
 
+### System Resources panel
+
+Reads the latest `sys_resources.N.jsonl` and shows the last `system_resource_sample`:
+
+- **CPU** — used % and free % with a colour-coded progress bar
+- **RAM** — used / total MB and free % with a progress bar
+- **Swap** — used / total MB with a progress bar
+- **Network** — per-interface RX / TX MB/s and error count
+- **Disks** — per-mount free GB and free % with a progress bar
+- **GPU** — utilisation, VRAM free, temperature, NVENC encoder % (when available)
+
+Progress bars are green / yellow / red based on the default alert thresholds.
+
 ---
 
 ## Config (`monitor.config.json`)
 
-All three binaries read the same file.
+All four binaries read the same file.
 
 ```json
 {
   "log_rotation": { ... },
   "monitors": {
     "process_monitor": { ... },
-    "system_monitor":  { ... }
+    "system_monitor":  { ... },
+    "go2rtc_monitor":  { ... }
   }
 }
 ```
@@ -180,17 +203,58 @@ threshold (limit breached).  Both are optional — omit either to disable that l
 
 ---
 
+### `monitors.go2rtc_monitor`
+
+Disabled by default — omitting the section entirely is equivalent to `"enabled": false`.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `enabled` | `false` | Set `true` to activate |
+| `log_file` | `go2rtc_streams.jsonl` | Base name for log files |
+| `api_url` | `http://localhost:1984` | go2rtc base URL |
+| `poll_interval_ms` | 10000 | How often to poll the streams API (`0` = off) |
+| `log.stream_changes` | `true` | Log `stream_up` / `stream_down` on producer state changes |
+| `log.consumer_changes` | `true` | Log `consumer_change` when viewer count changes |
+| `log.stream_sample` | `true` | Log a full `stream_sample` on every poll |
+
+Minimal example to enable go2rtc monitoring on a default install:
+
+```json
+"go2rtc_monitor": {
+  "enabled": true
+}
+```
+
+Full example with custom URL and logging options:
+
+```json
+"go2rtc_monitor": {
+  "enabled": true,
+  "api_url": "http://192.168.1.10:1984",
+  "poll_interval_ms": 5000,
+  "log": {
+    "stream_changes":   true,
+    "consumer_changes": true,
+    "stream_sample":    false
+  }
+}
+```
+
+---
+
 ## Log file naming
 
 Each monitor uses numbered rotation independently:
 
 ```
-proc_resources.0.jsonl   ← oldest
+proc_resources.0.jsonl     ← oldest
 proc_resources.1.jsonl
-proc_resources.2.jsonl   ← active
+proc_resources.2.jsonl     ← active
 
 sys_resources.0.jsonl
-sys_resources.1.jsonl    ← active
+sys_resources.1.jsonl      ← active
+
+go2rtc_streams.0.jsonl     ← active
 ```
 
 Every file starts with a `monitor_start` entry.  Rotation entries include
@@ -205,7 +269,7 @@ All events share the same envelope:
 ```json
 {
   "ts":      "2026-03-23T10:00:00.000Z",
-  "monitor": "process_monitor | system_monitor",
+  "monitor": "process_monitor | system_monitor | go2rtc_monitor",
   "event":   "<event_name>",
   "level":   "INFO | WARN | ERROR",
   "...":     "event-specific fields"
@@ -214,7 +278,7 @@ All events share the same envelope:
 
 ---
 
-### Shared events (both monitors)
+### Shared events (all monitors)
 
 #### `monitor_start`
 ```json
@@ -336,6 +400,50 @@ Written every `poll_interval_ms`.
 
 ---
 
+### go2rtc-monitor events
+
+#### `stream_up`
+Emitted when a stream's producer becomes active (or when a new active stream is first seen).
+```json
+{ "name": "front_yard", "producer_url": "rtsp://admin:pass@192.168.1.100/stream1" }
+```
+
+#### `stream_down`
+Emitted at WARN level when a producer goes offline or a stream disappears from the API.
+```json
+{ "name": "front_yard" }
+```
+
+#### `consumer_change`
+Emitted when the number of viewers for a stream changes.
+```json
+{ "name": "front_yard", "consumer_count": 2, "previous_count": 1 }
+```
+
+#### `stream_sample`
+Written every `poll_interval_ms` — full snapshot of all streams.
+```json
+{
+  "streams": [
+    { "name": "front_yard", "producer_active": true,
+      "producer_url": "rtsp://admin:pass@192.168.1.100/stream1", "consumer_count": 2 },
+    { "name": "back_door",  "producer_active": false, "consumer_count": 0 }
+  ],
+  "total_count": 2,
+  "active_count": 1
+}
+```
+
+#### `api_error`
+Emitted at WARN level when go2rtc is unreachable or returns an unparseable response.
+The monitor keeps polling — it never exits due to API errors.
+```json
+{ "msg": "Cannot reach go2rtc API: http://localhost:1984/api/streams",
+  "detail": "Connection refused (os error 111)" }
+```
+
+---
+
 ## GPU monitoring (NVIDIA)
 
 Build with `--features nvidia` to enable NVML-based GPU monitoring.
@@ -357,7 +465,7 @@ AMD and Intel GPUs are listed in `system_info` but real-time metrics require the
 ## Grep examples
 
 ```powershell
-# All WARN and ERROR entries across both monitors
+# All WARN and ERROR entries across all monitors
 Get-ChildItem C:\monitor\*.jsonl | Get-Content |
   ConvertFrom-Json | Where-Object level -ne INFO
 
@@ -385,4 +493,22 @@ Get-Content C:\monitor\proc_resources.0.jsonl |
   Select-Object -Last 50 |
   ForEach-Object { $_.total_cpu_percent } |
   Measure-Object -Average
+
+# Stream up/down history
+Get-Content C:\monitor\go2rtc_streams.0.jsonl |
+  ConvertFrom-Json |
+  Where-Object { $_.event -in @("stream_up", "stream_down") } |
+  Select-Object ts, event, name
+
+# Current consumer counts across all streams
+Get-Content C:\monitor\go2rtc_streams.0.jsonl |
+  ConvertFrom-Json |
+  Where-Object event -eq stream_sample |
+  Select-Object -Last 1 |
+  ForEach-Object { $_.streams } |
+  Select-Object name, producer_active, consumer_count
+
+# All API errors (go2rtc unreachable)
+Get-Content C:\monitor\go2rtc_streams.*.jsonl |
+  ConvertFrom-Json | Where-Object event -eq api_error
 ```

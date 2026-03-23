@@ -266,3 +266,42 @@ pub struct SystemResourceSampleData {
     /// One entry per detected NVIDIA GPU.  Empty when NVML is unavailable.
     pub gpus: Vec<GpuSample>,
 }
+
+// ── go2rtc-monitor event data ─────────────────────────────────────────────────
+
+/// One stream entry inside a `stream_sample` event.
+#[derive(Serialize)]
+pub struct StreamInfo {
+    pub name:            String,
+    /// true when at least one producer is in an active state.
+    pub producer_active: bool,
+    /// URL of the first producer, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub producer_url:    Option<String>,
+    /// Number of current consumers (viewers).
+    pub consumer_count:  usize,
+}
+
+/// Written every `poll_interval_ms` by go2rtc-monitor.
+#[derive(Serialize)]
+pub struct StreamSampleData {
+    pub streams:      Vec<StreamInfo>,
+    pub total_count:  usize,
+    pub active_count: usize,
+}
+
+/// A stream's producer became active (`stream_up`) or went offline (`stream_down`).
+#[derive(Serialize)]
+pub struct StreamStateChangeData {
+    pub name:         String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub producer_url: Option<String>,
+}
+
+/// The consumer count for a stream changed.
+#[derive(Serialize)]
+pub struct ConsumerChangeData {
+    pub name:           String,
+    pub consumer_count: usize,
+    pub previous_count: usize,
+}

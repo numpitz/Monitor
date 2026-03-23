@@ -56,6 +56,9 @@ pub struct MonitorsConfig {
 
     #[serde(default)]
     pub system_monitor: SystemMonitorConfig,
+
+    #[serde(default)]
+    pub go2rtc_monitor: Go2rtcMonitorConfig,
 }
 
 // ── process-monitor ───────────────────────────────────────────────────────────
@@ -286,3 +289,62 @@ fn default_resource_poll_ms() -> u64    { 5_000 }
 fn default_snapshot_ms()      -> u64    { 60_000 }
 fn default_sys_log_file()     -> String { "sys_resources.jsonl".into() }
 fn default_sys_poll_ms()      -> u64    { 30_000 }
+
+// ── go2rtc-monitor ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Go2rtcMonitorConfig {
+    /// Disabled by default — go2rtc may not be present on every system.
+    #[serde(default)]
+    pub enabled: bool,
+
+    #[serde(default = "default_go2rtc_log_file")]
+    pub log_file: String,
+
+    /// Base URL of the go2rtc instance, e.g. `http://localhost:1984`.
+    #[serde(default = "default_go2rtc_api_url")]
+    pub api_url: String,
+
+    /// How often to poll the go2rtc streams API (milliseconds). `0` = off.
+    #[serde(default = "default_go2rtc_poll_ms")]
+    pub poll_interval_ms: u64,
+
+    #[serde(default)]
+    pub log: Go2rtcMonitorLogConfig,
+}
+
+impl Default for Go2rtcMonitorConfig {
+    fn default() -> Self {
+        Self {
+            enabled:          false,
+            log_file:         default_go2rtc_log_file(),
+            api_url:          default_go2rtc_api_url(),
+            poll_interval_ms: default_go2rtc_poll_ms(),
+            log:              Go2rtcMonitorLogConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Go2rtcMonitorLogConfig {
+    /// Log `stream_up` / `stream_down` when a stream's producer state changes.
+    #[serde(default = "yes")] pub stream_changes:   bool,
+    /// Log `consumer_change` when viewer count changes for a stream.
+    #[serde(default = "yes")] pub consumer_changes: bool,
+    /// Log a full `stream_sample` on every poll.
+    #[serde(default = "yes")] pub stream_sample:    bool,
+}
+
+impl Default for Go2rtcMonitorLogConfig {
+    fn default() -> Self {
+        Self {
+            stream_changes:   true,
+            consumer_changes: true,
+            stream_sample:    true,
+        }
+    }
+}
+
+fn default_go2rtc_log_file() -> String { "go2rtc_streams.jsonl".into() }
+fn default_go2rtc_api_url()  -> String { "http://localhost:1984".into() }
+fn default_go2rtc_poll_ms()  -> u64    { 10_000 }

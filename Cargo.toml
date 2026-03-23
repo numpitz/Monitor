@@ -21,6 +21,10 @@ path = "src/bin/system_monitor.rs"
 name = "monitor-ui"
 path = "src/bin/monitor_ui.rs"
 
+[[bin]]
+name = "go2rtc-monitor"
+path = "src/bin/go2rtc_monitor.rs"
+
 # ── cross-platform deps ───────────────────────────────────────────────────────
 [dependencies]
 anyhow               = "1"
@@ -36,6 +40,7 @@ parking_lot          = "0.12"
 serde                = { version = "1",   features = ["derive"] }
 serde_json           = "1"
 sysinfo              = "0.31"
+ureq             = "2"
 
 # ── Windows-only deps ─────────────────────────────────────────────────────────
 [target.'cfg(windows)'.dependencies]
