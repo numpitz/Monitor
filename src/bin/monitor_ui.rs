@@ -116,6 +116,8 @@ struct TimelineBucket {
     proc_count:   usize,
     sys_count:    usize,
     go2rtc_count: usize,
+    warn_count:   usize,
+    error_count:  usize,
 }
 
 impl TimelineBucket {
@@ -359,12 +361,41 @@ impl MonitorApp {
             buckets[i].ts_start = t_start + i as f64 * bucket_dur;
             buckets[i].ts_end   = t_start + (i + 1) as f64 * bucket_dur;
         }
-        for (ts, src) in &timestamps {
+        // Second pass: fill bucket counters (we need level too, so re-scan from files)
+        // Re-use the timestamps vec by also storing level: 0=info,1=warn,2=error
+        drop(timestamps); // free memory before re-scan
+
+        let mut entries: Vec<(f64, usize, u8)> = Vec::new(); // (ts, src, level)
+        for (src, base) in [&proc_base, &sys_base, &go2rtc_base].iter().enumerate() {
+            for path in find_all_logs(&self.log_dir, base) {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    for line in content.lines() {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                            if let Some(ts) = parse_ts_secs(&v) {
+                                let lvl = match v.get("level").and_then(|l| l.as_str()) {
+                                    Some("ERROR") => 2,
+                                    Some("WARN")  => 1,
+                                    _             => 0,
+                                };
+                                entries.push((ts, src, lvl));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for (ts, src, lvl) in &entries {
             let idx = (((ts - t_start) / bucket_dur) as usize).min(N_BUCKETS - 1);
             match src {
                 0 => buckets[idx].proc_count   += 1,
                 1 => buckets[idx].sys_count    += 1,
                 2 => buckets[idx].go2rtc_count += 1,
+                _ => {}
+            }
+            match lvl {
+                2 => buckets[idx].error_count += 1,
+                1 => buckets[idx].warn_count  += 1,
                 _ => {}
             }
         }
@@ -618,7 +649,7 @@ impl eframe::App for MonitorApp {
                                     egui::pos2(x0, rect.top() + 3.0),
                                     egui::vec2((bucket_w - 2.0).max(1.0), cell_h - 6.0),
                                 );
-                                painter.rect_filled(cell, 2.0, heatmap_color(bucket.total(), max_tot));
+                                painter.rect_filled(cell, 2.0, heatmap_color(bucket.total(), max_tot, bucket.warn_count, bucket.error_count));
                                 if i == self.timeline_idx {
                                     painter.rect_stroke(cell, 2.0,
                                         egui::Stroke::new(2.0, egui::Color32::WHITE));
@@ -647,6 +678,8 @@ impl eframe::App for MonitorApp {
                                 if b.proc_count   > 0 { lines.push(format!("Process monitor: {} entries",  b.proc_count));   }
                                 if b.sys_count    > 0 { lines.push(format!("System monitor:  {} entries",  b.sys_count));    }
                                 if b.go2rtc_count > 0 { lines.push(format!("go2rtc monitor:  {} entries",  b.go2rtc_count)); }
+                                if b.error_count  > 0 { lines.push(format!("⚠ Errors:  {}", b.error_count)); }
+                                if b.warn_count   > 0 { lines.push(format!("⚠ Warnings: {}", b.warn_count));  }
                                 if b.total()      == 0 { lines.push("No log entries".to_string()); }
                                 lines.join("\n")
                             });
@@ -1209,10 +1242,12 @@ fn fmt_bucket_datetime(ts: f64) -> String {
 }
 
 /// GitHub-style four-level green heatmap colour. Grey = empty.
-fn heatmap_color(count: usize, max_count: usize) -> egui::Color32 {
+fn heatmap_color(count: usize, max_count: usize, warn: usize, error: usize) -> egui::Color32 {
     if count == 0 || max_count == 0 {
         return egui::Color32::from_gray(45);
     }
+    if error > 0 { return egui::Color32::from_rgb(192,  57,  43); }  // red   #c0392b
+    if warn  > 0 { return egui::Color32::from_rgb(212, 172,  13); }  // amber #d4ac0d
     let ratio = count as f32 / max_count as f32;
     if      ratio < 0.25 { egui::Color32::from_rgb(155, 233, 168) }  // #9be9a8
     else if ratio < 0.50 { egui::Color32::from_rgb( 64, 196,  99) }  // #40c463
