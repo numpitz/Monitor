@@ -105,6 +105,30 @@ struct StreamRow {
     ts:              String,
 }
 
+// ── Timeline ──────────────────────────────────────────────────────────────────
+
+const N_BUCKETS: usize = 60;
+
+#[derive(Clone, Default)]
+struct TimelineBucket {
+    ts_start:     f64,   // unix seconds
+    ts_end:       f64,
+    proc_count:   usize,
+    sys_count:    usize,
+    go2rtc_count: usize,
+}
+
+impl TimelineBucket {
+    fn total(&self) -> usize { self.proc_count + self.sys_count + self.go2rtc_count }
+}
+
+#[derive(Clone)]
+struct Timeline {
+    buckets: Vec<TimelineBucket>,
+    t_start: f64,
+    t_end:   f64,
+}
+
 // ── Tab selection ─────────────────────────────────────────────────────────────
 
 #[derive(PartialEq)]
@@ -151,6 +175,11 @@ struct MonitorApp {
 
     /// How often the UI re-reads the log files (seconds). 0 = manual only.
     ui_refresh_secs: u32,
+
+    // ── Timeline ──────────────────────────────────────────────────────────────
+    timeline:     Option<Timeline>,
+    /// 0 = oldest bucket … N_BUCKETS-1 = live (no cutoff).
+    timeline_idx: usize,
 }
 
 impl MonitorApp {
@@ -191,7 +220,9 @@ impl MonitorApp {
                     go2rtc_last_refresh: None,
                     go2rtc_source_file:  String::new(),
                     ui_refresh_secs,
-                    selected_tab: Tab::Runtime,
+                    selected_tab:  Tab::Runtime,
+                    timeline:      None,
+                    timeline_idx:  N_BUCKETS - 1,
                 }
             }
             Err(e) => Self {
@@ -220,12 +251,15 @@ impl MonitorApp {
                 go2rtc_last_refresh: None,
                 go2rtc_source_file:  String::new(),
                 ui_refresh_secs:     5,
-                selected_tab: Tab::Runtime,
+                selected_tab:  Tab::Runtime,
+                timeline:      None,
+                timeline_idx:  N_BUCKETS - 1,
             },
         };
-        app.refresh_processes();
-        app.refresh_system();
-        app.refresh_streams();
+        app.refresh_processes(None);
+        app.refresh_system(None);
+        app.refresh_streams(None);
+        app.build_timeline();
         app
     }
 
@@ -265,67 +299,149 @@ impl MonitorApp {
         self.status = "Saved — monitors will pick up the change automatically.".into();
     }
 
-    /// Rebuild the process table from the latest proc_resources log file.
-    fn refresh_processes(&mut self) {
+    // ── Timeline helpers ──────────────────────────────────────────────────────
+
+    /// True when viewing the live (newest) end of the timeline.
+    fn is_live(&self) -> bool {
+        match &self.timeline {
+            None     => true,
+            Some(tl) => self.timeline_idx >= tl.buckets.len().saturating_sub(1),
+        }
+    }
+
+    /// Returns `None` (no cutoff = live) or `Some(ts)` for historical views.
+    fn selected_cutoff_ts(&self) -> Option<f64> {
+        if self.is_live() { return None; }
+        self.timeline.as_ref()
+            .and_then(|tl| tl.buckets.get(self.timeline_idx))
+            .map(|b| b.ts_end)
+    }
+
+    /// Scan all log files and rebuild the 60-bucket activity heatmap.
+    fn build_timeline(&mut self) {
+        let proc_base = match &self.config {
+            Ok(cfg) => cfg.monitors.process_monitor.log_file.clone(),
+            Err(_)  => "proc_resources.jsonl".to_string(),
+        };
+        let sys_base = match &self.config {
+            Ok(cfg) => cfg.monitors.system_monitor.log_file.clone(),
+            Err(_)  => "sys_resources.jsonl".to_string(),
+        };
+        let go2rtc_base = match &self.config {
+            Ok(cfg) => cfg.monitors.go2rtc_monitor.log_file.clone(),
+            Err(_)  => "go2rtc_streams.jsonl".to_string(),
+        };
+
+        let mut timestamps: Vec<(f64, usize)> = Vec::new(); // (unix_secs, source 0/1/2)
+        for (src, base) in [&proc_base, &sys_base, &go2rtc_base].iter().enumerate() {
+            for path in find_all_logs(&self.log_dir, base) {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    for line in content.lines() {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                            if let Some(ts) = parse_ts_secs(&v) {
+                                timestamps.push((ts, src));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if timestamps.is_empty() { self.timeline = None; return; }
+
+        let t_start = timestamps.iter().map(|(t, _)| *t).fold(f64::MAX, f64::min);
+        let t_end   = timestamps.iter().map(|(t, _)| *t).fold(f64::MIN, f64::max);
+        let dur     = (t_end - t_start).max(1.0);
+        let bucket_dur = dur / N_BUCKETS as f64;
+
+        let mut buckets = vec![TimelineBucket::default(); N_BUCKETS];
+        for i in 0..N_BUCKETS {
+            buckets[i].ts_start = t_start + i as f64 * bucket_dur;
+            buckets[i].ts_end   = t_start + (i + 1) as f64 * bucket_dur;
+        }
+        for (ts, src) in &timestamps {
+            let idx = (((ts - t_start) / bucket_dur) as usize).min(N_BUCKETS - 1);
+            match src {
+                0 => buckets[idx].proc_count   += 1,
+                1 => buckets[idx].sys_count    += 1,
+                2 => buckets[idx].go2rtc_count += 1,
+                _ => {}
+            }
+        }
+
+        let was_live = self.is_live();
+        self.timeline = Some(Timeline { buckets, t_start, t_end });
+        if was_live { self.timeline_idx = N_BUCKETS - 1; }
+        // else keep the existing historical position
+    }
+
+    // ── Data refresh ──────────────────────────────────────────────────────────
+
+    /// Rebuild the process table.
+    /// `until_ts = None` → read only the newest file (live).
+    /// `until_ts = Some(ts)` → read all files, skip entries after ts.
+    fn refresh_processes(&mut self, until_ts: Option<f64>) {
         let base = match &self.config {
             Ok(cfg) => cfg.monitors.process_monitor.log_file.clone(),
             Err(_)  => "proc_resources.jsonl".to_string(),
         };
-        let log_path = match find_latest_log(&self.log_dir, &base) {
-            Some(p) => p,
-            None => {
-                self.proc_source_file  = "no log file found".into();
-                self.proc_last_refresh = Some(Instant::now());
-                return;
-            }
+        let paths: Vec<std::path::PathBuf> = if until_ts.is_some() {
+            find_all_logs(&self.log_dir, &base)
+        } else {
+            find_latest_log(&self.log_dir, &base).into_iter().collect()
         };
-        let content = match std::fs::read_to_string(&log_path) {
-            Ok(c)  => c,
-            Err(e) => {
-                self.proc_source_file  = format!("read error: {e}");
-                self.proc_last_refresh = Some(Instant::now());
-                return;
-            }
-        };
+        if paths.is_empty() {
+            self.proc_source_file  = "no log file found".into();
+            self.proc_last_refresh = Some(Instant::now());
+            return;
+        }
 
         let mut map: HashMap<u32, ProcessRow> = HashMap::new();
-        for line in content.lines() {
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-            match v.get("event").and_then(|e| e.as_str()).unwrap_or("") {
-                "process_spawned" => {
-                    let pid = val_u32(&v, "pid");
-                    let name = val_str(&v, "name");
-                    let last_seen = ts_time(&v);
-                    map.entry(pid).or_insert_with(|| ProcessRow {
-                        pid, name, last_seen, alive: true, ..Default::default()
-                    });
+        for path in &paths {
+            let content = match std::fs::read_to_string(path) {
+                Ok(c)  => c,
+                Err(e) => { self.proc_source_file = format!("read error: {e}"); return; }
+            };
+            for line in content.lines() {
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+                if let Some(cut) = until_ts {
+                    if parse_ts_secs(&v).map_or(false, |ts| ts > cut) { continue; }
                 }
-                "process_exited" => {
-                    let pid = val_u32(&v, "pid");
-                    if let Some(row) = map.get_mut(&pid) {
-                        row.alive     = false;
-                        row.last_seen = ts_time(&v);
+                match v.get("event").and_then(|e| e.as_str()).unwrap_or("") {
+                    "process_spawned" => {
+                        let pid = val_u32(&v, "pid");
+                        let name = val_str(&v, "name");
+                        let last_seen = ts_time(&v);
+                        map.entry(pid).or_insert_with(|| ProcessRow {
+                            pid, name, last_seen, alive: true, ..Default::default()
+                        });
                     }
-                }
-                "resource_sample" => {
-                    let sample_ts = ts_time(&v);
-                    if let Some(procs) = v.get("processes").and_then(|p| p.as_array()) {
-                        for p in procs {
-                            let pid  = val_u32(p, "pid");
-                            let name = val_str(p, "name");
-                            let row  = map.entry(pid).or_insert_with(|| ProcessRow {
-                                pid, name: name.clone(), alive: true, ..Default::default()
-                            });
-                            row.cpu_percent = p.get("cpu_percent").and_then(|x| x.as_f64()).unwrap_or(0.0);
-                            row.memory_mb   = p.get("memory_mb")  .and_then(|x| x.as_f64()).unwrap_or(0.0);
-                            row.handles     = p.get("handles")    .and_then(|x| x.as_u64()).unwrap_or(0) as u32;
-                            row.threads     = p.get("threads")    .and_then(|x| x.as_u64()).unwrap_or(0) as u32;
-                            row.last_seen   = sample_ts.clone();
-                            row.alive       = true;
+                    "process_exited" => {
+                        let pid = val_u32(&v, "pid");
+                        if let Some(row) = map.get_mut(&pid) {
+                            row.alive = false; row.last_seen = ts_time(&v);
                         }
                     }
+                    "resource_sample" => {
+                        let sample_ts = ts_time(&v);
+                        if let Some(procs) = v.get("processes").and_then(|p| p.as_array()) {
+                            for p in procs {
+                                let pid  = val_u32(p, "pid");
+                                let name = val_str(p, "name");
+                                let row  = map.entry(pid).or_insert_with(|| ProcessRow {
+                                    pid, name: name.clone(), alive: true, ..Default::default()
+                                });
+                                row.cpu_percent = p.get("cpu_percent").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                                row.memory_mb   = p.get("memory_mb")  .and_then(|x| x.as_f64()).unwrap_or(0.0);
+                                row.handles     = p.get("handles")    .and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+                                row.threads     = p.get("threads")    .and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+                                row.last_seen   = sample_ts.clone();
+                                row.alive       = true;
+                            }
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
         }
 
@@ -333,76 +449,82 @@ impl MonitorApp {
         rows.sort_by(|a, b| b.alive.cmp(&a.alive).then(a.name.cmp(&b.name)));
         self.proc_rows         = rows;
         self.proc_last_refresh = Some(Instant::now());
-        self.proc_source_file  = log_path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        self.proc_source_file  = paths.last().and_then(|p| p.file_name())
+            .unwrap_or_default().to_string_lossy().into_owned();
     }
 
-    /// Read the latest system_resource_sample from the sys_resources log file.
-    fn refresh_system(&mut self) {
+    /// Read the system_resource_sample at or before the cutoff.
+    fn refresh_system(&mut self, until_ts: Option<f64>) {
         let base = match &self.config {
             Ok(cfg) => cfg.monitors.system_monitor.log_file.clone(),
             Err(_)  => "sys_resources.jsonl".to_string(),
         };
-        let log_path = match find_latest_log(&self.log_dir, &base) {
-            Some(p) => p,
-            None => {
-                self.sys_source_file  = "no log file found".into();
-                self.sys_last_refresh = Some(Instant::now());
-                return;
-            }
+        let paths: Vec<std::path::PathBuf> = if until_ts.is_some() {
+            find_all_logs(&self.log_dir, &base)
+        } else {
+            find_latest_log(&self.log_dir, &base).into_iter().collect()
         };
-        let content = match std::fs::read_to_string(&log_path) {
-            Ok(c)  => c,
-            Err(e) => {
-                self.sys_source_file  = format!("read error: {e}");
-                self.sys_last_refresh = Some(Instant::now());
-                return;
-            }
-        };
+        if paths.is_empty() {
+            self.sys_source_file  = "no log file found".into();
+            self.sys_last_refresh = Some(Instant::now());
+            return;
+        }
 
-        // Walk all lines; keep the last system_resource_sample.
         let mut last: Option<serde_json::Value> = None;
-        for line in content.lines() {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                if v.get("event").and_then(|e| e.as_str()) == Some("system_resource_sample") {
-                    last = Some(v);
+        for path in &paths {
+            let content = match std::fs::read_to_string(path) {
+                Ok(c)  => c,
+                Err(e) => { self.sys_source_file = format!("read error: {e}"); return; }
+            };
+            for line in content.lines() {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                    if let Some(cut) = until_ts {
+                        if parse_ts_secs(&v).map_or(false, |ts| ts > cut) { continue; }
+                    }
+                    if v.get("event").and_then(|e| e.as_str()) == Some("system_resource_sample") {
+                        last = Some(v);
+                    }
                 }
             }
         }
 
-        self.sys_sample = last.as_ref().map(parse_sys_sample);
+        self.sys_sample       = last.as_ref().map(parse_sys_sample);
         self.sys_last_refresh = Some(Instant::now());
-        self.sys_source_file  = log_path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        self.sys_source_file  = paths.last().and_then(|p| p.file_name())
+            .unwrap_or_default().to_string_lossy().into_owned();
     }
 
-    /// Read the last `stream_sample` event from the go2rtc_streams log file.
-    fn refresh_streams(&mut self) {
+    /// Read the stream_sample at or before the cutoff.
+    fn refresh_streams(&mut self, until_ts: Option<f64>) {
         let base = match &self.config {
             Ok(cfg) => cfg.monitors.go2rtc_monitor.log_file.clone(),
             Err(_)  => "go2rtc_streams.jsonl".to_string(),
         };
-        let log_path = match find_latest_log(&self.log_dir, &base) {
-            Some(p) => p,
-            None => {
-                self.go2rtc_source_file  = "no log file found".into();
-                self.go2rtc_last_refresh = Some(Instant::now());
-                return;
-            }
+        let paths: Vec<std::path::PathBuf> = if until_ts.is_some() {
+            find_all_logs(&self.log_dir, &base)
+        } else {
+            find_latest_log(&self.log_dir, &base).into_iter().collect()
         };
-        let content = match std::fs::read_to_string(&log_path) {
-            Ok(c)  => c,
-            Err(e) => {
-                self.go2rtc_source_file  = format!("read error: {e}");
-                self.go2rtc_last_refresh = Some(Instant::now());
-                return;
-            }
-        };
+        if paths.is_empty() {
+            self.go2rtc_source_file  = "no log file found".into();
+            self.go2rtc_last_refresh = Some(Instant::now());
+            return;
+        }
 
-        // Keep only the last stream_sample event.
         let mut last: Option<serde_json::Value> = None;
-        for line in content.lines() {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                if v.get("event").and_then(|e| e.as_str()) == Some("stream_sample") {
-                    last = Some(v);
+        for path in &paths {
+            let content = match std::fs::read_to_string(path) {
+                Ok(c)  => c,
+                Err(e) => { self.go2rtc_source_file = format!("read error: {e}"); return; }
+            };
+            for line in content.lines() {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                    if let Some(cut) = until_ts {
+                        if parse_ts_secs(&v).map_or(false, |ts| ts > cut) { continue; }
+                    }
+                    if v.get("event").and_then(|e| e.as_str()) == Some("stream_sample") {
+                        last = Some(v);
+                    }
                 }
             }
         }
@@ -418,12 +540,11 @@ impl MonitorApp {
                     ts:              ts.clone(),
                 }).collect())
                 .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+        } else { Vec::new() };
 
         self.go2rtc_last_refresh = Some(Instant::now());
-        self.go2rtc_source_file  = log_path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        self.go2rtc_source_file  = paths.last().and_then(|p| p.file_name())
+            .unwrap_or_default().to_string_lossy().into_owned();
     }
 }
 
@@ -431,16 +552,19 @@ impl MonitorApp {
 
 impl eframe::App for MonitorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Auto-refresh all viewers when the interval is active (> 0).
+        // Auto-refresh — only when viewing live data.
         if self.ui_refresh_secs > 0 {
             let interval    = Duration::from_secs(self.ui_refresh_secs as u64);
-            let proc_due    = self.proc_last_refresh   .map_or(true, |t| t.elapsed() >= interval);
-            let sys_due     = self.sys_last_refresh    .map_or(true, |t| t.elapsed() >= interval);
-            let streams_due = self.go2rtc_last_refresh .map_or(true, |t| t.elapsed() >= interval);
-            if proc_due    { self.refresh_processes(); }
-            if sys_due     { self.refresh_system(); }
-            if streams_due { self.refresh_streams(); }
             ctx.request_repaint_after(interval);
+            if self.is_live() {
+                let proc_due    = self.proc_last_refresh   .map_or(true, |t| t.elapsed() >= interval);
+                let sys_due     = self.sys_last_refresh    .map_or(true, |t| t.elapsed() >= interval);
+                let streams_due = self.go2rtc_last_refresh .map_or(true, |t| t.elapsed() >= interval);
+                if proc_due    { self.refresh_processes(None); }
+                if sys_due     { self.refresh_system(None); }
+                if streams_due { self.refresh_streams(None); }
+                if proc_due || sys_due || streams_due { self.build_timeline(); }
+            }
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -468,29 +592,155 @@ impl eframe::App for MonitorApp {
 
                     // ══════════════════════════════════════════════════════════
                     Tab::Runtime => {
-                        // Refresh-all button + auto-refresh slider
-                        ui.horizontal(|ui| {
-                            if ui.small_button("⟳  Refresh all").clicked() {
-                                self.refresh_processes();
-                                self.refresh_system();
-                                self.refresh_streams();
+                        // ── Timeline heatmap ───────────────────────────────────
+                        let tl_clone = self.timeline.clone();
+                        let mut new_timeline_idx: Option<usize> = None;
+                        let mut do_jump_live    = false;
+                        let mut do_refresh_all  = false;
+
+                        if let Some(ref tl) = tl_clone {
+                            let n        = tl.buckets.len();
+                            let avail_w  = ui.available_width();
+                            let cell_h   = 36.0_f32;
+                            let max_tot  = tl.buckets.iter().map(|b| b.total()).max().unwrap_or(1).max(1);
+                            let bucket_w = avail_w / n as f32;
+
+                            let (rect, response) = ui.allocate_exact_size(
+                                egui::vec2(avail_w, cell_h),
+                                egui::Sense::click_and_drag(),
+                            );
+                            let painter = ui.painter_at(rect);
+                            painter.rect_filled(rect, 3.0, egui::Color32::from_gray(28));
+
+                            for (i, bucket) in tl.buckets.iter().enumerate() {
+                                let x0   = rect.left() + i as f32 * bucket_w + 1.0;
+                                let cell = egui::Rect::from_min_size(
+                                    egui::pos2(x0, rect.top() + 3.0),
+                                    egui::vec2((bucket_w - 2.0).max(1.0), cell_h - 6.0),
+                                );
+                                painter.rect_filled(cell, 2.0, heatmap_color(bucket.total(), max_tot));
+                                if i == self.timeline_idx {
+                                    painter.rect_stroke(cell, 2.0,
+                                        egui::Stroke::new(2.0, egui::Color32::WHITE));
+                                }
                             }
-                            ui.separator();
-                            ui.label("Auto-refresh every");
-                            let before = self.ui_refresh_secs;
-                            ui.add(egui::Slider::new(&mut self.ui_refresh_secs, 0..=60)
-                                .suffix(" s").clamping(egui::SliderClamping::Always));
-                            if self.ui_refresh_secs != before { self.dirty = true; self.status.clear(); }
-                            ui.label(egui::RichText::new(interval_hint(self.ui_refresh_secs))
-                                .small().color(egui::Color32::GRAY));
-                        });
+                            // Cursor line
+                            let cx = rect.left() + (self.timeline_idx as f32 + 0.5) * bucket_w;
+                            painter.line_segment(
+                                [egui::pos2(cx, rect.top()), egui::pos2(cx, rect.bottom())],
+                                egui::Stroke::new(1.5, egui::Color32::from_rgba_premultiplied(255,255,255,180)),
+                            );
+
+                            // Extract interaction data before consuming response
+                            let clicked       = response.clicked();
+                            let dragged       = response.dragged();
+                            let interact_pos  = response.interact_pointer_pos();
+                            let hover_pos     = response.hover_pos();
+
+                            let hover_text: Option<String> = hover_pos.map(|pos| {
+                                let frac = ((pos.x - rect.left()) / avail_w).clamp(0.0, 1.0);
+                                let idx  = ((frac * n as f32) as usize).min(n - 1);
+                                let b    = &tl.buckets[idx];
+                                let mut lines = vec![
+                                    format!("{} – {}", fmt_bucket_time(b.ts_start), fmt_bucket_time(b.ts_end)),
+                                ];
+                                if b.proc_count   > 0 { lines.push(format!("Process monitor: {} entries",  b.proc_count));   }
+                                if b.sys_count    > 0 { lines.push(format!("System monitor:  {} entries",  b.sys_count));    }
+                                if b.go2rtc_count > 0 { lines.push(format!("go2rtc monitor:  {} entries",  b.go2rtc_count)); }
+                                if b.total()      == 0 { lines.push("No log entries".to_string()); }
+                                lines.join("\n")
+                            });
+                            if let Some(text) = hover_text { response.on_hover_text(text); }
+
+                            if clicked || dragged {
+                                if let Some(pos) = interact_pos {
+                                    let frac = ((pos.x - rect.left()) / avail_w).clamp(0.0, 1.0);
+                                    let idx  = ((frac * n as f32) as usize).min(n - 1);
+                                    if idx != self.timeline_idx { new_timeline_idx = Some(idx); }
+                                }
+                            }
+
+                            // Status bar
+                            let is_live_now = self.timeline_idx >= n - 1;
+                            let cutoff_label = if !is_live_now {
+                                tl.buckets.get(self.timeline_idx)
+                                    .map(|b| fmt_bucket_datetime(b.ts_end))
+                                    .unwrap_or_default()
+                            } else { String::new() };
+                            let t_start_label = fmt_bucket_time(tl.t_start);
+                            let t_end_label   = fmt_bucket_time(tl.t_end);
+
+                            ui.add_space(2.0);
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new(t_start_label).small().color(egui::Color32::GRAY));
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    ui.label(egui::RichText::new(t_end_label).small().color(egui::Color32::GRAY));
+                                });
+                            });
+                            ui.horizontal(|ui| {
+                                if is_live_now {
+                                    ui.colored_label(egui::Color32::from_rgb(80, 200, 80), "● LIVE");
+                                } else {
+                                    ui.label(format!("Viewing up to: {cutoff_label}"));
+                                    if ui.small_button("Jump to live").clicked() { do_jump_live = true; }
+                                }
+                                ui.separator();
+                                if ui.small_button("⟳  Refresh").clicked() { do_refresh_all = true; }
+                                ui.separator();
+                                ui.label("Auto-refresh:");
+                                let before = self.ui_refresh_secs;
+                                ui.add(egui::Slider::new(&mut self.ui_refresh_secs, 0..=60)
+                                    .suffix(" s").clamping(egui::SliderClamping::Always));
+                                if self.ui_refresh_secs != before { self.dirty = true; self.status.clear(); }
+                            });
+                        } else {
+                            // No timeline yet: plain controls
+                            ui.horizontal(|ui| {
+                                if ui.small_button("⟳  Refresh all").clicked() { do_refresh_all = true; }
+                                ui.separator();
+                                ui.label("Auto-refresh:");
+                                let before = self.ui_refresh_secs;
+                                ui.add(egui::Slider::new(&mut self.ui_refresh_secs, 0..=60)
+                                    .suffix(" s").clamping(egui::SliderClamping::Always));
+                                if self.ui_refresh_secs != before { self.dirty = true; self.status.clear(); }
+                            });
+                        }
+
+                        // Apply timeline interactions
+                        if let Some(idx) = new_timeline_idx {
+                            self.timeline_idx = idx;
+                            let cut = self.selected_cutoff_ts();
+                            self.refresh_processes(cut);
+                            self.refresh_system(cut);
+                            self.refresh_streams(cut);
+                        }
+                        if do_jump_live {
+                            self.timeline_idx = N_BUCKETS - 1;
+                            self.refresh_processes(None);
+                            self.refresh_system(None);
+                            self.refresh_streams(None);
+                            self.build_timeline();
+                        }
+                        if do_refresh_all {
+                            let cut = self.selected_cutoff_ts();
+                            self.refresh_processes(cut);
+                            self.refresh_system(cut);
+                            self.refresh_streams(cut);
+                            if self.is_live() { self.build_timeline(); }
+                        }
+
+                        ui.add_space(8.0);
+                        ui.separator();
 
                         // ── Watched Processes ──────────────────────────────────
-                        ui.add_space(12.0);
+                        ui.add_space(6.0);
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new("Watched Processes").strong());
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.small_button("⟳").clicked() { self.refresh_processes(); }
+                                if ui.small_button("⟳").clicked() {
+                                    let cut = self.selected_cutoff_ts();
+                                    self.refresh_processes(cut);
+                                }
                                 if !self.proc_source_file.is_empty() {
                                     ui.label(egui::RichText::new(&self.proc_source_file)
                                         .small().color(egui::Color32::GRAY));
@@ -548,7 +798,10 @@ impl eframe::App for MonitorApp {
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new("System Resources").strong());
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.small_button("⟳").clicked() { self.refresh_system(); }
+                                if ui.small_button("⟳").clicked() {
+                                    let cut = self.selected_cutoff_ts();
+                                    self.refresh_system(cut);
+                                }
                                 if !self.sys_source_file.is_empty() {
                                     ui.label(egui::RichText::new(&self.sys_source_file)
                                         .small().color(egui::Color32::GRAY));
@@ -694,7 +947,10 @@ impl eframe::App for MonitorApp {
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new("go2rtc Streams").strong());
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.small_button("⟳").clicked() { self.refresh_streams(); }
+                                if ui.small_button("⟳").clicked() {
+                                    let cut = self.selected_cutoff_ts();
+                                    self.refresh_streams(cut);
+                                }
                                 if !self.go2rtc_source_file.is_empty() {
                                     ui.label(egui::RichText::new(&self.go2rtc_source_file)
                                         .small().color(egui::Color32::GRAY));
@@ -909,6 +1165,60 @@ impl eframe::App for MonitorApp {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Return ALL rotation files for `base_name`, sorted oldest-first (lowest N first).
+fn find_all_logs(log_dir: &Path, base_name: &str) -> Vec<PathBuf> {
+    let stem = base_name.trim_end_matches(".jsonl");
+    let mut found: Vec<(u32, PathBuf)> = Vec::new();
+    let Ok(entries) = std::fs::read_dir(log_dir) else { return Vec::new() };
+    for entry in entries.flatten() {
+        let fname = entry.file_name();
+        let name  = fname.to_string_lossy();
+        if let Some(rest) = name.strip_prefix(&format!("{stem}.")) {
+            if let Some(n_str) = rest.strip_suffix(".jsonl") {
+                if let Ok(n) = n_str.parse::<u32>() {
+                    found.push((n, entry.path()));
+                }
+            }
+        }
+    }
+    found.sort_by_key(|(n, _)| *n);
+    found.into_iter().map(|(_, p)| p).collect()
+}
+
+/// Parse the `ts` field of a log entry into unix seconds.
+fn parse_ts_secs(v: &serde_json::Value) -> Option<f64> {
+    let s = v.get("ts")?.as_str()?;
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| dt.timestamp_millis() as f64 / 1000.0)
+}
+
+/// Format unix seconds as `HH:MM` (UTC).
+fn fmt_bucket_time(ts: f64) -> String {
+    chrono::DateTime::from_timestamp(ts as i64, 0)
+        .map(|dt: chrono::DateTime<chrono::Utc>| dt.format("%H:%M").to_string())
+        .unwrap_or_else(|| "?".to_string())
+}
+
+/// Format unix seconds as `YYYY-MM-DD HH:MM:SS` (UTC).
+fn fmt_bucket_datetime(ts: f64) -> String {
+    chrono::DateTime::from_timestamp(ts as i64, 0)
+        .map(|dt: chrono::DateTime<chrono::Utc>| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_else(|| "?".to_string())
+}
+
+/// GitHub-style four-level green heatmap colour. Grey = empty.
+fn heatmap_color(count: usize, max_count: usize) -> egui::Color32 {
+    if count == 0 || max_count == 0 {
+        return egui::Color32::from_gray(45);
+    }
+    let ratio = count as f32 / max_count as f32;
+    if      ratio < 0.25 { egui::Color32::from_rgb(155, 233, 168) }  // #9be9a8
+    else if ratio < 0.50 { egui::Color32::from_rgb( 64, 196,  99) }  // #40c463
+    else if ratio < 0.75 { egui::Color32::from_rgb( 48, 161,  78) }  // #30a14e
+    else                 { egui::Color32::from_rgb( 33, 110,  57) }  // #216e39
+}
 
 /// Find the highest-numbered rotation of `base_name` in `log_dir`.
 /// Files are named `<stem>.<n>.jsonl`.
