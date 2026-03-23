@@ -826,9 +826,9 @@ impl eframe::App for MonitorApp {
                         .color(egui::Color32::GRAY));
                 } else {
                     egui::Grid::new("stream_header")
-                        .num_columns(4).spacing([12.0, 2.0])
+                        .num_columns(5).spacing([12.0, 2.0])
                         .show(ui, |ui| {
-                            for label in ["Name", "Status", "Consumers", "Last seen"] {
+                            for label in ["Name", "Status", "Producer URL", "Consumers", "Last seen"] {
                                 ui.label(egui::RichText::new(label).strong().small());
                             }
                             ui.end_row();
@@ -839,13 +839,10 @@ impl eframe::App for MonitorApp {
                         .max_height(180.0)
                         .show(ui, |ui| {
                             egui::Grid::new("stream_table")
-                                .num_columns(4).spacing([12.0, 4.0]).striped(true)
+                                .num_columns(5).spacing([12.0, 4.0]).striped(true)
                                 .show(ui, |ui| {
                                     for row in &self.go2rtc_stream_rows {
-                                        let name_label = ui.label(&row.name);
-                                        if !row.producer_url.is_empty() {
-                                            name_label.on_hover_text(&row.producer_url);
-                                        }
+                                        ui.label(&row.name);
                                         if row.producer_active {
                                             ui.colored_label(
                                                 egui::Color32::from_rgb(80, 180, 80),
@@ -854,6 +851,33 @@ impl eframe::App for MonitorApp {
                                         } else {
                                             ui.colored_label(egui::Color32::GRAY, "Inactive");
                                         }
+                                        // URL column: truncated text + copy button
+                                        ui.horizontal(|ui| {
+                                            if row.producer_url.is_empty() {
+                                                ui.label(egui::RichText::new("—")
+                                                    .color(egui::Color32::GRAY).small());
+                                            } else {
+                                                let short: String = row.producer_url
+                                                    .chars().take(40)
+                                                    .chain(if row.producer_url.chars().count() > 40 {
+                                                        Some('…')
+                                                    } else {
+                                                        None
+                                                    })
+                                                    .collect();
+                                                ui.label(egui::RichText::new(short)
+                                                    .small().monospace())
+                                                    .on_hover_text(&row.producer_url);
+                                                if ui.small_button("⧉")
+                                                    .on_hover_text("Copy URL to clipboard")
+                                                    .clicked()
+                                                {
+                                                    ui.output_mut(|o| {
+                                                        o.copied_text = row.producer_url.clone();
+                                                    });
+                                                }
+                                            }
+                                        });
                                         ui.label(row.consumer_count.to_string());
                                         ui.label(egui::RichText::new(&row.ts)
                                             .small().color(egui::Color32::GRAY));
