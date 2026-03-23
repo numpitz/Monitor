@@ -26,7 +26,6 @@
 use anyhow::Result;
 use clap::Parser;
 use crossbeam_channel::bounded;
-use parking_lot::RwLock;
 use std::{
     path::PathBuf,
     process::{Child, Command},
@@ -43,7 +42,6 @@ use process_monitor::{
     config::Config,
     events::*,
     send,
-    watch_config,
     writer::LogWriter,
 };
 
@@ -68,25 +66,48 @@ struct Args {
 
 struct ManagedChild {
     /// Human-readable name used in log messages.
-    name:          &'static str,
+    name:            &'static str,
     /// Executable file stem (without `.exe`), expected next to this binary.
-    binary:        &'static str,
-    child:         Option<Child>,
-    started_at:    Option<Instant>,
-    /// Time of the most recent unexpected exit (drives restart timer).
-    last_exit_at:  Option<Instant>,
-    restart_count: u32,
+    binary:          &'static str,
+    /// When `false`, the child is never restarted after it exits (e.g. monitor-ui:
+    /// closing the window is intentional and the watchdog should not reopen it).
+    restart_on_exit: bool,
+    /// When `false`, `--no-console` is NOT forwarded even if the watchdog uses it
+    /// (e.g. monitor-ui is a GUI app and the flag would be meaningless / harmful).
+    pass_no_console: bool,
+    child:           Option<Child>,
+    started_at:      Option<Instant>,
+    /// Time of the most recent exit (drives restart timer).
+    last_exit_at:    Option<Instant>,
+    restart_count:   u32,
 }
 
 impl ManagedChild {
-    fn new(name: &'static str, binary: &'static str) -> Self {
+    /// A background monitor: restarted on exit, forwards `--no-console`.
+    fn monitor(name: &'static str, binary: &'static str) -> Self {
         Self {
             name,
             binary,
-            child:         None,
-            started_at:    None,
-            last_exit_at:  None,
-            restart_count: 0,
+            restart_on_exit: true,
+            pass_no_console: true,
+            child:           None,
+            started_at:      None,
+            last_exit_at:    None,
+            restart_count:   0,
+        }
+    }
+
+    /// A GUI tool: started once, never restarted, never gets `--no-console`.
+    fn gui(name: &'static str, binary: &'static str) -> Self {
+        Self {
+            name,
+            binary,
+            restart_on_exit: false,
+            pass_no_console: false,
+            child:           None,
+            started_at:      None,
+            last_exit_at:    None,
+            restart_count:   0,
         }
     }
 
@@ -120,7 +141,12 @@ fn main() -> Result<()> {
     // ── Load config ───────────────────────────────────────────────────────────
     let cfg      = Config::load(&log_dir)?;
     let rotation = cfg.log_rotation.clone();
-    let config   = Arc::new(RwLock::new(cfg));
+    // Config is re-read from disk on each supervision tick (no watcher thread
+    // needed — avoids the hung-join problem that would block clean shutdown).
+    let mut current_cfg    = cfg;
+    let mut last_cfg_check = Instant::now()
+        .checked_sub(Duration::from_secs(60))
+        .unwrap_or_else(Instant::now); // force a re-read on the very first tick
 
     // ── Create log writer ─────────────────────────────────────────────────────
     let monitor_pid = std::process::id();
@@ -171,15 +197,6 @@ fn main() -> Result<()> {
         })
     };
 
-    // ── Config-watcher thread ─────────────────────────────────────────────────
-    let _config_watcher = {
-        let config     = config.clone();
-        let log_dir    = log_dir.clone();
-        let tx         = tx.clone();
-        let no_console = args.no_console;
-        thread::spawn(move || watch_config(MONITOR, config, log_dir, tx, no_console))
-    };
-
     // ── Shutdown flag ─────────────────────────────────────────────────────────
     let running = Arc::new(AtomicBool::new(true));
     {
@@ -190,21 +207,32 @@ fn main() -> Result<()> {
 
     // ── Managed children (order determines startup order) ─────────────────────
     let mut children = vec![
-        ManagedChild::new("process-monitor", "process-monitor"),
-        ManagedChild::new("system-monitor",  "system-monitor"),
-        ManagedChild::new("go2rtc-monitor",  "go2rtc-monitor"),
+        ManagedChild::monitor("process-monitor", "process-monitor"),
+        ManagedChild::monitor("system-monitor",  "system-monitor"),
+        ManagedChild::monitor("go2rtc-monitor",  "go2rtc-monitor"),
+        ManagedChild::gui    ("monitor-ui",       "monitor-ui"),
     ];
 
     // ── Main supervision loop ─────────────────────────────────────────────────
     while running.load(Ordering::SeqCst) {
         let tick = Instant::now();
 
-        // Re-read enabled flags every iteration so config hot-reload works.
-        let monitors_cfg = config.read().monitors.clone();
+        // Re-read config from disk every 5 s — picks up any changes the user
+        // makes while the watchdog is running without needing a watcher thread.
+        if last_cfg_check.elapsed() >= Duration::from_secs(5) {
+            if let Ok(new_cfg) = Config::load(&log_dir) {
+                current_cfg = new_cfg;
+            }
+            last_cfg_check = Instant::now();
+        }
+
+        // The UI has no config-driven enabled flag — it is always started.
+        let monitors_cfg = &current_cfg.monitors;
         let enabled = [
             monitors_cfg.process_monitor.enabled,
-            monitors_cfg.system_monitor.enabled,
-            monitors_cfg.go2rtc_monitor.enabled,
+            monitors_cfg.system_monitor .enabled,
+            monitors_cfg.go2rtc_monitor .enabled,
+            true, // monitor-ui: always start
         ];
 
         for (mc, &en) in children.iter_mut().zip(enabled.iter()) {
@@ -238,26 +266,42 @@ fn main() -> Result<()> {
                 let uptime    = mc.started_at.map_or(0, |t| t.elapsed().as_secs());
                 let exit_code = status.code();
                 mc.child      = None;
-                mc.last_exit_at = Some(Instant::now());
 
-                cprint!(args.no_console,
-                    "[watchdog] {} exited  code={:?}  uptime={}s  — will restart in {}s",
-                    mc.name, exit_code, uptime, RESTART_DELAY.as_secs());
-
-                send(&tx, &LogEntry::warn(MONITOR, "child_exited", ChildExitedData {
-                    name:           mc.name.to_string(),
-                    exit_code,
-                    uptime_seconds: uptime,
-                }));
+                if mc.restart_on_exit {
+                    mc.last_exit_at = Some(Instant::now());
+                    cprint!(args.no_console,
+                        "[watchdog] {} exited  code={:?}  uptime={}s  — will restart in {}s",
+                        mc.name, exit_code, uptime, RESTART_DELAY.as_secs());
+                    send(&tx, &LogEntry::warn(MONITOR, "child_exited", ChildExitedData {
+                        name:           mc.name.to_string(),
+                        exit_code,
+                        uptime_seconds: uptime,
+                    }));
+                } else {
+                    cprint!(args.no_console,
+                        "[watchdog] {} closed  code={:?}  uptime={}s  (not restarting)",
+                        mc.name, exit_code, uptime);
+                    send(&tx, &LogEntry::info(MONITOR, "child_exited", ChildExitedData {
+                        name:           mc.name.to_string(),
+                        exit_code,
+                        uptime_seconds: uptime,
+                    }));
+                }
             }
 
             // ── Start or restart if not running and delay has passed ───────────
             if !mc.is_running() {
+                // Never restart a GUI tool once the user has closed it.
+                if !mc.restart_on_exit && mc.restart_count > 0 {
+                    continue;
+                }
+
                 let delay_passed = mc.last_exit_at
                     .map_or(true, |t| t.elapsed() >= RESTART_DELAY);
 
                 if delay_passed {
-                    match spawn_child(&exe_dir, mc.binary, &log_dir, args.no_console) {
+                    let effective_no_console = args.no_console && mc.pass_no_console;
+                    match spawn_child(&exe_dir, mc.binary, &log_dir, effective_no_console) {
                         Ok(child) => {
                             let pid = child.id();
                             mc.child      = Some(child);
@@ -332,10 +376,11 @@ fn spawn_child(
     log_dir:    &PathBuf,
     no_console: bool,
 ) -> Result<Child> {
-    #[cfg(windows)]
-    let exe_name = format!("{binary}.exe");
-    #[cfg(not(windows))]
-    let exe_name = binary.to_string();
+    let exe_name = if cfg!(windows) {
+        format!("{binary}.exe")
+    } else {
+        binary.to_string()
+    };
 
     let exe_path = exe_dir.join(&exe_name);
 

@@ -58,13 +58,14 @@ monitor-watchdog.exe C:\monitor\ --no-console
 ```
 
 The watchdog starts every monitor that is `"enabled": true` in the config,
-monitors them every 500 ms, and restarts any that exit unexpectedly within 3 s.
-Closing (or Ctrl-C) the watchdog stops all child monitors cleanly.
+**plus `monitor-ui`**, monitors them every 500 ms, and restarts any monitor that
+exits unexpectedly within 3 s.  Ctrl-C (or closing the console window) kills all
+children first, then exits cleanly.
 
 If a monitor is **disabled** in the config while the watchdog is running, the
 watchdog kills that child and does not restart it.  If a monitor is **enabled**
-in the config while the watchdog is running, the watchdog starts it on the next
-tick — no restart of the watchdog required.
+in the config while the watchdog is running, the watchdog starts it within 5 s —
+no restart of the watchdog required.
 
 ### Run monitors individually (advanced)
 
@@ -78,18 +79,22 @@ go2rtc-monitor.exe  C:\monitor\
 process-monitor.exe C:\monitor\ --no-console
 system-monitor.exe  C:\monitor\ --no-console
 go2rtc-monitor.exe  C:\monitor\ --no-console
-```
 
-### Configuration UI
-
-```powershell
+# Configuration UI (started automatically by the watchdog — only needed here
+# when running monitors individually)
 monitor-ui.exe C:\monitor\
 ```
 
 ### Live configuration
 
-The UI writes changes atomically.  All monitors pick them up within ~400 ms
-via their built-in config-watcher — **no restart required**.
+The UI writes changes atomically.
+
+| Component | Picks up config changes within… |
+|-----------|----------------------------------|
+| `process-monitor`, `system-monitor`, `go2rtc-monitor` | ~400 ms (built-in file-watcher) |
+| `monitor-watchdog` (enabled / disabled flags) | 5 s (periodic disk poll) |
+
+No restart required for any component.
 
 ---
 
@@ -105,7 +110,15 @@ The watchdog is the single entry point for production deployments.
 | Monitor exits unexpectedly | Log `child_exited`, restart after 3 s |
 | Monitor disabled in config while running | Kill immediately, do not restart |
 | Spawn fails (binary not found, etc.) | Log `child_start_failed`, retry after 3 s |
-| Watchdog receives Ctrl-C / SIGTERM | Kill all children, drain log, exit 0 |
+| Watchdog receives Ctrl-C | Kill all children, drain log, exit 0 |
+| `monitor-ui` window closed by user | Log `child_exited` at INFO, do **not** reopen |
+
+`monitor-ui` is always launched alongside the monitors — no config flag needed.
+It is treated as a one-shot GUI tool: if the user closes the window the watchdog
+leaves it closed.  All other children are restarted automatically.
+
+Config changes are picked up every **5 s** by re-reading `monitor.config.json`
+from disk — no file-watcher thread is used in the watchdog.
 
 ### Watchdog log events
 
