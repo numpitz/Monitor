@@ -1,0 +1,57 @@
+name: Release
+
+# Triggered by pushing a version tag, e.g.:
+#   git tag v0.1.0
+#   git push origin v0.1.0
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-release:
+    name: Build & publish Windows release
+    runs-on: windows-latest
+
+    permissions:
+      contents: write   # needed to create the GitHub Release
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build release binaries
+        run: cargo build --release
+
+      - name: Collect release assets
+        run: |
+          New-Item -ItemType Directory -Force release-assets
+          Copy-Item target\release\monitor-watchdog.exe  release-assets\
+          Copy-Item target\release\process-monitor.exe   release-assets\
+          Copy-Item target\release\system-monitor.exe    release-assets\
+          Copy-Item target\release\go2rtc-monitor.exe    release-assets\
+          Copy-Item target\release\monitor-ui.exe        release-assets\
+          Copy-Item config\monitor.config.json           release-assets\
+        shell: pwsh
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          generate_release_notes: true
