@@ -1061,6 +1061,14 @@ impl eframe::App for MonitorApp {
                                     .height(140.0)
                                     .include_y(0.0)
                                     .x_axis_formatter(|mark, _range| fmt_bucket_time(mark.value))
+                                    .label_formatter(|name, point| {
+                                        let time = fmt_plot_time(point.x);
+                                        if name.is_empty() {
+                                            time
+                                        } else {
+                                            format!("{name}\n{time}\n{:.2}", point.y)
+                                        }
+                                    })
                                     .show(ui, |plot_ui| {
                                         for (series_key, label, color) in &lines {
                                             if let Some(all_pts) = self.plot_series.get(series_key) {
@@ -1762,6 +1770,13 @@ fn parse_ts_secs(v: &serde_json::Value) -> Option<f64> {
     chrono::DateTime::parse_from_rfc3339(s)
         .ok()
         .map(|dt| dt.timestamp_millis() as f64 / 1000.0)
+}
+
+/// Format unix seconds as `HH:MM:SS` (UTC) — used in plot hover tooltip.
+fn fmt_plot_time(ts: f64) -> String {
+    chrono::DateTime::from_timestamp(ts as i64, 0)
+        .map(|dt: chrono::DateTime<chrono::Utc>| dt.format("%H:%M:%S").to_string())
+        .unwrap_or_else(|| "?".to_string())
 }
 
 /// Format unix seconds as `HH:MM` (UTC).
