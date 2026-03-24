@@ -13,7 +13,7 @@ use eframe::egui;
 use egui_plot;
 use process_monitor::config::Config;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -75,12 +75,21 @@ struct DiskRow {
     write_mb_per_sec: f64,
 }
 
+struct CoreRow {
+    id:       u32,
+    used_pct: f64,
+}
+
 struct GpuRow {
     name:         String,
     util_pct:     f64,
-    vram_free_mb: f64,
-    temp_c:       Option<u32>,
-    encoder_pct:  Option<u32>,
+    vram_total_mb: f64,
+    vram_used_mb:  f64,
+    vram_free_mb:  f64,
+    temp_c:        Option<u32>,
+    encoder_pct:   Option<u32>,
+    decoder_pct:   Option<u32>,
+    power_w:       Option<f64>,
 }
 
 struct SysSample {
@@ -93,6 +102,7 @@ struct SysSample {
     swap_total_mb:       f64,
     swap_used_mb:        f64,
     swap_used_pct:       f64,
+    cores:               Vec<CoreRow>,
     network:             Vec<NetRow>,
     disks:               Vec<DiskRow>,
     gpus:                Vec<GpuRow>,
@@ -184,9 +194,14 @@ struct MonitorApp {
     /// 0 = oldest bucket … N_BUCKETS-1 = live (no cutoff).
     timeline_idx: usize,
 
-    // ── Resource plot data (CPU %, RAM %) over time ───────────────────────────
-    plot_cpu: Vec<[f64; 2]>,   // [unix_secs, cpu_used_pct]
-    plot_ram: Vec<[f64; 2]>,   // [unix_secs, ram_used_pct]
+    // ── Resource plot ─────────────────────────────────────────────────────────
+    /// All collected time-series. Keys: "cpu", "ram", "swap",
+    /// "net:{iface}:rx", "net:{iface}:tx", "disk:{path}:rd", "disk:{path}:wr",
+    /// "gpu:{name}:util"
+    plot_series:   HashMap<String, Vec<[f64; 2]>>,
+    /// Checkbox keys currently selected for display. Uses the "group" key
+    /// (e.g. "net:eth0") which maps to one or more series keys.
+    plot_selected: HashSet<String>,
 }
 
 impl MonitorApp {
@@ -230,8 +245,8 @@ impl MonitorApp {
                     selected_tab:  Tab::Runtime,
                     timeline:      None,
                     timeline_idx:  N_BUCKETS - 1,
-                    plot_cpu:      Vec::new(),
-                    plot_ram:      Vec::new(),
+                    plot_series:   HashMap::new(),
+                    plot_selected: ["cpu".to_string(), "ram".to_string()].into_iter().collect(),
                 }
             }
             Err(e) => Self {
@@ -263,8 +278,8 @@ impl MonitorApp {
                 selected_tab:  Tab::Runtime,
                 timeline:      None,
                 timeline_idx:  N_BUCKETS - 1,
-                plot_cpu:      Vec::new(),
-                plot_ram:      Vec::new(),
+                plot_series:   HashMap::new(),
+                plot_selected: ["cpu".to_string(), "ram".to_string()].into_iter().collect(),
             },
         };
         app.refresh_processes(None);
@@ -417,33 +432,107 @@ impl MonitorApp {
         self.build_plot_data();
     }
 
-    /// Scan system log files and build CPU % / RAM % time-series for the plot.
+    /// Scan system log files and build all available time-series for the chart.
     fn build_plot_data(&mut self) {
         let base = match &self.config {
             Ok(cfg) => cfg.monitors.system_monitor.log_file.clone(),
             Err(_)  => "sys_resources.jsonl".to_string(),
         };
-        let mut cpu_pts: Vec<[f64; 2]> = Vec::new();
-        let mut ram_pts: Vec<[f64; 2]> = Vec::new();
+        let mut series: HashMap<String, Vec<[f64; 2]>> = HashMap::new();
         for path in find_all_logs(&self.log_dir, &base) {
             if let Ok(content) = std::fs::read_to_string(&path) {
                 for line in content.lines() {
                     let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
                     if v.get("event").and_then(|e| e.as_str()) != Some("system_resource_sample") { continue; }
                     let Some(ts) = parse_ts_secs(&v) else { continue };
-                    let cpu     = v.get("cpu_used_percent") .and_then(|x| x.as_f64()).unwrap_or(0.0);
-                    let total   = v.get("memory_total_mb")  .and_then(|x| x.as_f64()).unwrap_or(1.0);
-                    let used    = v.get("memory_used_mb")   .and_then(|x| x.as_f64()).unwrap_or(0.0);
-                    let ram_pct = if total > 0.0 { used / total * 100.0 } else { 0.0 };
-                    cpu_pts.push([ts, cpu]);
-                    ram_pts.push([ts, ram_pct]);
+
+                    // CPU (system-wide)
+                    let cpu = v.get("cpu_used_percent").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                    series.entry("cpu".into()).or_default().push([ts, cpu]);
+
+                    // Per-core CPU
+                    if let Some(cores) = v.get("cores").and_then(|c| c.as_array()) {
+                        for core in cores {
+                            let id   = core.get("id")          .and_then(|x| x.as_u64()).unwrap_or(0);
+                            let used = core.get("used_percent").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                            series.entry(format!("cpu_core:{id}")).or_default().push([ts, used]);
+                        }
+                    }
+
+                    // RAM
+                    let mem_total = v.get("memory_total_mb").and_then(|x| x.as_f64()).unwrap_or(1.0);
+                    let mem_used  = v.get("memory_used_mb") .and_then(|x| x.as_f64()).unwrap_or(0.0);
+                    let ram_pct   = if mem_total > 0.0 { mem_used / mem_total * 100.0 } else { 0.0 };
+                    series.entry("ram".into()).or_default().push([ts, ram_pct]);
+
+                    // Swap
+                    let swap_total = v.get("swap_total_mb").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                    let swap_used  = v.get("swap_used_mb") .and_then(|x| x.as_f64()).unwrap_or(0.0);
+                    if swap_total > 0.0 {
+                        let swap_pct = swap_used / swap_total * 100.0;
+                        series.entry("swap".into()).or_default().push([ts, swap_pct]);
+                    }
+
+                    // Network
+                    if let Some(nets) = v.get("network").and_then(|n| n.as_array()) {
+                        for net in nets {
+                            let iface = val_str(net, "interface");
+                            if iface.is_empty() { continue; }
+                            let rx = net.get("rx_mb_per_sec").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                            let tx = net.get("tx_mb_per_sec").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                            series.entry(format!("net:{iface}:rx")).or_default().push([ts, rx]);
+                            series.entry(format!("net:{iface}:tx")).or_default().push([ts, tx]);
+                        }
+                    }
+
+                    // Disks
+                    if let Some(disks) = v.get("disks").and_then(|d| d.as_array()) {
+                        for disk in disks {
+                            let path = val_str(disk, "path");
+                            if path.is_empty() { continue; }
+                            let rd = disk.get("read_mb_per_sec") .and_then(|x| x.as_f64()).unwrap_or(0.0);
+                            let wr = disk.get("write_mb_per_sec").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                            series.entry(format!("disk:{path}:rd")).or_default().push([ts, rd]);
+                            series.entry(format!("disk:{path}:wr")).or_default().push([ts, wr]);
+                        }
+                    }
+
+                    // GPUs
+                    if let Some(gpus) = v.get("gpus").and_then(|g| g.as_array()) {
+                        for gpu in gpus {
+                            let name = val_str(gpu, "name");
+                            if name.is_empty() { continue; }
+                            let util = gpu.get("gpu_used_percent").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                            series.entry(format!("gpu:{name}:util")).or_default().push([ts, util]);
+                            // VRAM used %
+                            let vram_total = gpu.get("vram_total_mb").and_then(|x| x.as_f64()).unwrap_or(1.0);
+                            let vram_used  = gpu.get("vram_used_mb") .and_then(|x| x.as_f64()).unwrap_or(0.0);
+                            if vram_total > 0.0 {
+                                let vram_pct = vram_used / vram_total * 100.0;
+                                series.entry(format!("gpu:{name}:vram")).or_default().push([ts, vram_pct]);
+                            }
+                            // Optional fields (only present when hardware supports them)
+                            if let Some(t) = gpu.get("temperature_c").and_then(|x| x.as_f64()) {
+                                series.entry(format!("gpu:{name}:temp")).or_default().push([ts, t]);
+                            }
+                            if let Some(e) = gpu.get("encoder_percent").and_then(|x| x.as_f64()) {
+                                series.entry(format!("gpu:{name}:encoder")).or_default().push([ts, e]);
+                            }
+                            if let Some(d) = gpu.get("decoder_percent").and_then(|x| x.as_f64()) {
+                                series.entry(format!("gpu:{name}:decoder")).or_default().push([ts, d]);
+                            }
+                            if let Some(p) = gpu.get("power_w").and_then(|x| x.as_f64()) {
+                                series.entry(format!("gpu:{name}:power")).or_default().push([ts, p]);
+                            }
+                        }
+                    }
                 }
             }
         }
-        cpu_pts.sort_by(|a, b| a[0].partial_cmp(&b[0]).unwrap_or(std::cmp::Ordering::Equal));
-        ram_pts.sort_by(|a, b| a[0].partial_cmp(&b[0]).unwrap_or(std::cmp::Ordering::Equal));
-        self.plot_cpu = cpu_pts;
-        self.plot_ram = ram_pts;
+        for pts in series.values_mut() {
+            pts.sort_by(|a, b| a[0].partial_cmp(&b[0]).unwrap_or(std::cmp::Ordering::Equal));
+        }
+        self.plot_series = series;
     }
 
     // ── Data refresh ──────────────────────────────────────────────────────────
@@ -803,34 +892,105 @@ impl eframe::App for MonitorApp {
                         }
 
                         // ── Resource plot ──────────────────────────────────────
-                        if !self.plot_cpu.is_empty() || !self.plot_ram.is_empty() {
+                        if !self.plot_series.is_empty() && !self.plot_selected.is_empty() {
                             let cutoff = self.selected_cutoff_ts();
-                            let cpu_pts: Vec<[f64; 2]> = self.plot_cpu.iter()
-                                .filter(|p| cutoff.map_or(true, |c| p[0] <= c))
-                                .copied().collect();
-                            let ram_pts: Vec<[f64; 2]> = self.plot_ram.iter()
-                                .filter(|p| cutoff.map_or(true, |c| p[0] <= c))
-                                .copied().collect();
-
-                            egui_plot::Plot::new("resource_plot")
-                                .height(120.0)
-                                .include_y(0.0)
-                                .include_y(100.0)
-                                .x_axis_formatter(|mark, _range| fmt_bucket_time(mark.value))
-                                .y_axis_formatter(|mark, _range| format!("{:.0}%", mark.value))
-                                .legend(egui_plot::Legend::default().position(egui_plot::Corner::LeftTop))
-                                .show(ui, |plot_ui| {
-                                    plot_ui.line(
-                                        egui_plot::Line::new(egui_plot::PlotPoints::new(cpu_pts))
-                                            .color(egui::Color32::from_rgb(80, 180, 80))
-                                            .name("CPU"),
-                                    );
-                                    plot_ui.line(
-                                        egui_plot::Line::new(egui_plot::PlotPoints::new(ram_pts))
-                                            .color(egui::Color32::from_rgb(100, 150, 230))
-                                            .name("RAM"),
-                                    );
-                                });
+                            let palette = [
+                                egui::Color32::from_rgb( 80, 200,  80),  // green
+                                egui::Color32::from_rgb(100, 150, 230),  // blue
+                                egui::Color32::from_rgb(230, 160,  60),  // orange
+                                egui::Color32::from_rgb( 80, 210, 210),  // teal
+                                egui::Color32::from_rgb(200,  80, 200),  // purple
+                                egui::Color32::from_rgb(230, 230,  80),  // yellow
+                                egui::Color32::from_rgb(230, 100,  80),  // red-orange
+                                egui::Color32::from_rgb(230,  80, 160),  // pink
+                            ];
+                            // Resolve selected group-keys → (series_key, label, color)
+                            let mut lines: Vec<(String, String, egui::Color32)> = Vec::new();
+                            let mut ci = 0usize;
+                            let mut sel_sorted: Vec<&String> = self.plot_selected.iter().collect();
+                            sel_sorted.sort();
+                            for sel in sel_sorted {
+                                let c0 = palette[ci % palette.len()];
+                                match sel.as_str() {
+                                    "cpu"  => { lines.push(("cpu".into(),  "CPU %".into(),  c0)); ci += 1; }
+                                    "ram"  => { lines.push(("ram".into(),  "RAM %".into(),  c0)); ci += 1; }
+                                    "swap" => { lines.push(("swap".into(), "Swap %".into(), c0)); ci += 1; }
+                                    s if s.starts_with("net:") => {
+                                        let iface = &s["net:".len()..];
+                                        lines.push((format!("net:{iface}:rx"), format!("{iface} RX MB/s"), c0));
+                                        ci += 1;
+                                        let c1 = palette[ci % palette.len()];
+                                        lines.push((format!("net:{iface}:tx"), format!("{iface} TX MB/s"), c1));
+                                        ci += 1;
+                                    }
+                                    s if s.starts_with("disk:") => {
+                                        let p = &s["disk:".len()..];
+                                        let short = p.split(['/', '\\']).filter(|s| !s.is_empty()).last().unwrap_or(p);
+                                        lines.push((format!("disk:{p}:rd"), format!("{short} RD MB/s"), c0));
+                                        ci += 1;
+                                        let c1 = palette[ci % palette.len()];
+                                        lines.push((format!("disk:{p}:wr"), format!("{short} WR MB/s"), c1));
+                                        ci += 1;
+                                    }
+                                    s if s.starts_with("cpu_core:") => {
+                                        let id = &s["cpu_core:".len()..];
+                                        lines.push((s.to_string(), format!("Core {id} %"), c0));
+                                        ci += 1;
+                                    }
+                                    s if s.starts_with("gpu:") => {
+                                        // Direct key if it ends with a known metric suffix,
+                                        // otherwise treat as group key → :util
+                                        const GPU_SUFFIXES: &[(&str, &str)] = &[
+                                            (":util",    "util %"),
+                                            (":vram",    "VRAM %"),
+                                            (":temp",    "°C"),
+                                            (":encoder", "Enc %"),
+                                            (":decoder", "Dec %"),
+                                            (":power",   "W"),
+                                        ];
+                                        if let Some(&(sfx, unit)) = GPU_SUFFIXES.iter()
+                                            .find(|(sfx, _)| s.ends_with(sfx))
+                                        {
+                                            let name = &s["gpu:".len()..s.len() - sfx.len()];
+                                            let short: String = name.split_whitespace().take(2).collect::<Vec<_>>().join(" ");
+                                            lines.push((s.to_string(), format!("{short} {unit}"), c0));
+                                            ci += 1;
+                                        } else {
+                                            // Bare "gpu:{name}" → default to util %
+                                            let name = &s["gpu:".len()..];
+                                            let short: String = name.split_whitespace().take(2).collect::<Vec<_>>().join(" ");
+                                            lines.push((format!("gpu:{name}:util"), format!("{short} util %"), c0));
+                                            ci += 1;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            let has_data = lines.iter().any(|(k, _, _)|
+                                self.plot_series.get(k).map_or(false, |v| !v.is_empty()));
+                            if has_data {
+                                egui_plot::Plot::new("resource_plot")
+                                    .height(140.0)
+                                    .include_y(0.0)
+                                    .x_axis_formatter(|mark, _range| fmt_bucket_time(mark.value))
+                                    .legend(egui_plot::Legend::default().position(egui_plot::Corner::LeftTop))
+                                    .show(ui, |plot_ui| {
+                                        for (series_key, label, color) in &lines {
+                                            if let Some(all_pts) = self.plot_series.get(series_key) {
+                                                let pts: Vec<[f64; 2]> = all_pts.iter()
+                                                    .filter(|p| cutoff.map_or(true, |c| p[0] <= c))
+                                                    .copied().collect();
+                                                if !pts.is_empty() {
+                                                    plot_ui.line(
+                                                        egui_plot::Line::new(egui_plot::PlotPoints::new(pts))
+                                                            .color(*color)
+                                                            .name(label.as_str()),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    });
+                            }
                         }
 
                         ui.add_space(8.0);
@@ -926,6 +1086,11 @@ impl eframe::App for MonitorApp {
 
                             // CPU
                             ui.horizontal(|ui| {
+                                let mut sel = self.plot_selected.contains("cpu");
+                                if ui.checkbox(&mut sel, "").on_hover_text("Show in chart").changed() {
+                                    if sel { self.plot_selected.insert("cpu".into()); }
+                                    else   { self.plot_selected.remove("cpu"); }
+                                }
                                 ui.label(egui::RichText::new("CPU ").strong().monospace());
                                 ui.add(egui::ProgressBar::new(s.cpu_used_pct as f32 / 100.0)
                                     .desired_width(220.0)
@@ -935,9 +1100,42 @@ impl eframe::App for MonitorApp {
                                     .color(threshold_color(s.cpu_free_pct, 30.0, 10.0, Dir::Below)));
                             });
 
+                            // Per-core CPU — 2-per-row, same style as CPU/RAM/Swap
+                            if !s.cores.is_empty() {
+                                ui.add_space(2.0);
+                                egui::Grid::new("core_grid")
+                                    .num_columns(2).spacing([12.0, 2.0])
+                                    .show(ui, |ui| {
+                                        for (i, core) in s.cores.iter().enumerate() {
+                                            let key = format!("cpu_core:{}", core.id);
+                                            let mut sel = self.plot_selected.contains(&key);
+                                            ui.horizontal(|ui| {
+                                                if ui.checkbox(&mut sel, "")
+                                                    .on_hover_text("Show in chart").changed() {
+                                                    if sel { self.plot_selected.insert(key.clone()); }
+                                                    else   { self.plot_selected.remove(&key); }
+                                                }
+                                                ui.label(egui::RichText::new(format!("C{} ", core.id))
+                                                    .monospace().small().color(egui::Color32::GRAY));
+                                                ui.add(egui::ProgressBar::new(core.used_pct as f32 / 100.0)
+                                                    .desired_width(130.0)
+                                                    .fill(threshold_color(core.used_pct, 70.0, 90.0, Dir::Above))
+                                                    .text(format!("{:.0}%", core.used_pct)));
+                                            });
+                                            if i % 2 == 1 { ui.end_row(); }
+                                        }
+                                        if s.cores.len() % 2 == 1 { ui.end_row(); }
+                                    });
+                            }
+
                             // RAM
                             let mem_used_frac = (s.memory_used_mb / s.memory_total_mb.max(1.0)) as f32;
                             ui.horizontal(|ui| {
+                                let mut sel = self.plot_selected.contains("ram");
+                                if ui.checkbox(&mut sel, "").on_hover_text("Show in chart").changed() {
+                                    if sel { self.plot_selected.insert("ram".into()); }
+                                    else   { self.plot_selected.remove("ram"); }
+                                }
                                 ui.label(egui::RichText::new("RAM ").strong().monospace());
                                 ui.add(egui::ProgressBar::new(mem_used_frac)
                                     .desired_width(220.0)
@@ -951,6 +1149,11 @@ impl eframe::App for MonitorApp {
                             if s.swap_total_mb > 0.0 {
                                 let swap_frac = (s.swap_used_mb / s.swap_total_mb.max(1.0)) as f32;
                                 ui.horizontal(|ui| {
+                                    let mut sel = self.plot_selected.contains("swap");
+                                    if ui.checkbox(&mut sel, "").on_hover_text("Show in chart").changed() {
+                                        if sel { self.plot_selected.insert("swap".into()); }
+                                        else   { self.plot_selected.remove("swap"); }
+                                    }
                                     ui.label(egui::RichText::new("Swap").strong().monospace());
                                     ui.add(egui::ProgressBar::new(swap_frac)
                                         .desired_width(220.0)
@@ -966,9 +1169,15 @@ impl eframe::App for MonitorApp {
                                 ui.add_space(8.0);
                                 ui.label(egui::RichText::new("Network").strong());
                                 egui::Grid::new("net_grid")
-                                    .num_columns(5).spacing([16.0, 3.0]).striped(true)
+                                    .num_columns(6).spacing([16.0, 3.0]).striped(true)
                                     .show(ui, |ui| {
                                         for n in &s.network {
+                                            let key = format!("net:{}", n.interface);
+                                            let mut sel = self.plot_selected.contains(&key);
+                                            if ui.checkbox(&mut sel, "").on_hover_text("Show in chart").changed() {
+                                                if sel { self.plot_selected.insert(key.clone()); }
+                                                else   { self.plot_selected.remove(&key); }
+                                            }
                                             ui.label(&n.interface);
                                             ui.label(format!("DN  {:.2} MB/s", n.rx));
                                             ui.label(format!("UP  {:.2} MB/s", n.tx));
@@ -994,9 +1203,15 @@ impl eframe::App for MonitorApp {
                                 ui.add_space(8.0);
                                 ui.label(egui::RichText::new("Disks").strong());
                                 egui::Grid::new("disk_grid")
-                                    .num_columns(6).spacing([16.0, 3.0]).striped(true)
+                                    .num_columns(7).spacing([16.0, 3.0]).striped(true)
                                     .show(ui, |ui| {
                                         for d in &s.disks {
+                                            let key = format!("disk:{}", d.path);
+                                            let mut sel = self.plot_selected.contains(&key);
+                                            if ui.checkbox(&mut sel, "").on_hover_text("Show in chart").changed() {
+                                                if sel { self.plot_selected.insert(key.clone()); }
+                                                else   { self.plot_selected.remove(&key); }
+                                            }
                                             let used_frac = 1.0 - (d.free_pct as f32 / 100.0);
                                             ui.label(&d.path);
                                             ui.add(egui::ProgressBar::new(used_frac)
@@ -1018,9 +1233,15 @@ impl eframe::App for MonitorApp {
                                 ui.add_space(8.0);
                                 ui.label(egui::RichText::new("GPU").strong());
                                 egui::Grid::new("gpu_grid")
-                                    .num_columns(5).spacing([16.0, 3.0]).striped(true)
+                                    .num_columns(6).spacing([16.0, 3.0]).striped(true)
                                     .show(ui, |ui| {
                                         for g in &s.gpus {
+                                            let key = format!("gpu:{}:util", g.name);
+                                            let mut sel = self.plot_selected.contains(&key);
+                                            if ui.checkbox(&mut sel, "").on_hover_text("util % in chart").changed() {
+                                                if sel { self.plot_selected.insert(key.clone()); }
+                                                else   { self.plot_selected.remove(&key); }
+                                            }
                                             ui.label(&g.name);
                                             ui.label(egui::RichText::new(format!("{:.0}% util", g.util_pct))
                                                 .color(threshold_color(g.util_pct, 80.0, 95.0, Dir::Above)));
@@ -1041,6 +1262,93 @@ impl eframe::App for MonitorApp {
                                             ui.end_row();
                                         }
                                     });
+                                // Extended GPU metrics — indented rows, same style as other metrics
+                                for g in &s.gpus {
+                                    // VRAM
+                                    if g.vram_total_mb > 0.0 {
+                                        let vram_used_frac = (g.vram_used_mb / g.vram_total_mb.max(1.0)) as f32;
+                                        let vram_free_pct  = g.vram_free_mb / g.vram_total_mb.max(1.0) * 100.0;
+                                        ui.horizontal(|ui| {
+                                            ui.add_space(20.0);
+                                            let key = format!("gpu:{}:vram", g.name);
+                                            let mut sel = self.plot_selected.contains(&key);
+                                            if ui.checkbox(&mut sel, "").on_hover_text("Show in chart").changed() {
+                                                if sel { self.plot_selected.insert(key.clone()); }
+                                                else   { self.plot_selected.remove(&key); }
+                                            }
+                                            ui.label(egui::RichText::new("VRAM").strong().monospace());
+                                            ui.add(egui::ProgressBar::new(vram_used_frac)
+                                                .desired_width(180.0)
+                                                .fill(threshold_color(vram_free_pct, 25.0, 10.0, Dir::Below))
+                                                .text(format!("{:.0}/{:.0} MB", g.vram_used_mb, g.vram_total_mb)));
+                                            ui.label(egui::RichText::new(format!("{:.1}% free", vram_free_pct))
+                                                .color(threshold_color(vram_free_pct, 25.0, 10.0, Dir::Below)));
+                                        });
+                                    }
+                                    // Temperature
+                                    if let Some(t) = g.temp_c {
+                                        ui.horizontal(|ui| {
+                                            ui.add_space(20.0);
+                                            let key = format!("gpu:{}:temp", g.name);
+                                            let mut sel = self.plot_selected.contains(&key);
+                                            if ui.checkbox(&mut sel, "").on_hover_text("Show in chart").changed() {
+                                                if sel { self.plot_selected.insert(key.clone()); }
+                                                else   { self.plot_selected.remove(&key); }
+                                            }
+                                            ui.label(egui::RichText::new("Temp").strong().monospace());
+                                            ui.label(egui::RichText::new(format!("{t} °C"))
+                                                .color(threshold_color(t as f64, 80.0, 90.0, Dir::Above)));
+                                        });
+                                    }
+                                    // Encoder
+                                    if let Some(enc) = g.encoder_pct {
+                                        ui.horizontal(|ui| {
+                                            ui.add_space(20.0);
+                                            let key = format!("gpu:{}:encoder", g.name);
+                                            let mut sel = self.plot_selected.contains(&key);
+                                            if ui.checkbox(&mut sel, "").on_hover_text("Show in chart").changed() {
+                                                if sel { self.plot_selected.insert(key.clone()); }
+                                                else   { self.plot_selected.remove(&key); }
+                                            }
+                                            ui.label(egui::RichText::new("Enc ").strong().monospace());
+                                            ui.add(egui::ProgressBar::new(enc as f32 / 100.0)
+                                                .desired_width(140.0)
+                                                .fill(threshold_color(enc as f64, 80.0, 95.0, Dir::Above))
+                                                .text(format!("{enc}%")));
+                                        });
+                                    }
+                                    // Decoder
+                                    if let Some(dec) = g.decoder_pct {
+                                        ui.horizontal(|ui| {
+                                            ui.add_space(20.0);
+                                            let key = format!("gpu:{}:decoder", g.name);
+                                            let mut sel = self.plot_selected.contains(&key);
+                                            if ui.checkbox(&mut sel, "").on_hover_text("Show in chart").changed() {
+                                                if sel { self.plot_selected.insert(key.clone()); }
+                                                else   { self.plot_selected.remove(&key); }
+                                            }
+                                            ui.label(egui::RichText::new("Dec ").strong().monospace());
+                                            ui.add(egui::ProgressBar::new(dec as f32 / 100.0)
+                                                .desired_width(140.0)
+                                                .fill(threshold_color(dec as f64, 80.0, 95.0, Dir::Above))
+                                                .text(format!("{dec}%")));
+                                        });
+                                    }
+                                    // Power
+                                    if let Some(pwr) = g.power_w {
+                                        ui.horizontal(|ui| {
+                                            ui.add_space(20.0);
+                                            let key = format!("gpu:{}:power", g.name);
+                                            let mut sel = self.plot_selected.contains(&key);
+                                            if ui.checkbox(&mut sel, "").on_hover_text("Show in chart").changed() {
+                                                if sel { self.plot_selected.insert(key.clone()); }
+                                                else   { self.plot_selected.remove(&key); }
+                                            }
+                                            ui.label(egui::RichText::new("Pwr ").strong().monospace());
+                                            ui.label(format!("{pwr:.1} W"));
+                                        });
+                                    }
+                                }
                             }
                         }
 
@@ -1372,13 +1680,24 @@ fn parse_sys_sample(v: &serde_json::Value) -> SysSample {
         }).collect())
         .unwrap_or_default();
 
+    let cores = v.get("cores").and_then(|c| c.as_array())
+        .map(|arr| arr.iter().map(|c| CoreRow {
+            id:       c.get("id")          .and_then(|x| x.as_u64()).unwrap_or(0) as u32,
+            used_pct: c.get("used_percent").and_then(|x| x.as_f64()).unwrap_or(0.0),
+        }).collect())
+        .unwrap_or_default();
+
     let gpus = v.get("gpus").and_then(|g| g.as_array())
         .map(|arr| arr.iter().map(|g| GpuRow {
-            name:         val_str(g, "name"),
-            util_pct:     g.get("gpu_used_percent").and_then(|x| x.as_f64()).unwrap_or(0.0),
-            vram_free_mb: g.get("vram_free_mb")    .and_then(|x| x.as_f64()).unwrap_or(0.0),
-            temp_c:       g.get("temperature_c").and_then(|x| x.as_u64()).map(|x| x as u32),
-            encoder_pct:  g.get("encoder_percent") .and_then(|x| x.as_u64()).map(|x| x as u32),
+            name:          val_str(g, "name"),
+            util_pct:      g.get("gpu_used_percent").and_then(|x| x.as_f64()).unwrap_or(0.0),
+            vram_total_mb: g.get("vram_total_mb")  .and_then(|x| x.as_f64()).unwrap_or(0.0),
+            vram_used_mb:  g.get("vram_used_mb")   .and_then(|x| x.as_f64()).unwrap_or(0.0),
+            vram_free_mb:  g.get("vram_free_mb")   .and_then(|x| x.as_f64()).unwrap_or(0.0),
+            temp_c:        g.get("temperature_c")  .and_then(|x| x.as_u64()).map(|x| x as u32),
+            encoder_pct:   g.get("encoder_percent").and_then(|x| x.as_u64()).map(|x| x as u32),
+            decoder_pct:   g.get("decoder_percent").and_then(|x| x.as_u64()).map(|x| x as u32),
+            power_w:       g.get("power_w")        .and_then(|x| x.as_f64()),
         }).collect())
         .unwrap_or_default();
 
@@ -1392,6 +1711,7 @@ fn parse_sys_sample(v: &serde_json::Value) -> SysSample {
         swap_total_mb:   v.get("swap_total_mb")      .and_then(|x| x.as_f64()).unwrap_or(0.0),
         swap_used_mb:    v.get("swap_used_mb")       .and_then(|x| x.as_f64()).unwrap_or(0.0),
         swap_used_pct:   v.get("swap_used_percent")  .and_then(|x| x.as_f64()).unwrap_or(0.0),
+        cores,
         network,
         disks,
         gpus,
