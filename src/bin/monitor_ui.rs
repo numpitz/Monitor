@@ -10,6 +10,7 @@
 //!   4. go2rtc Streams    — last stream_sample from go2rtc_streams.N.jsonl
 
 use eframe::egui;
+use egui_plot;
 use process_monitor::config::Config;
 use std::{
     collections::HashMap,
@@ -182,6 +183,10 @@ struct MonitorApp {
     timeline:     Option<Timeline>,
     /// 0 = oldest bucket … N_BUCKETS-1 = live (no cutoff).
     timeline_idx: usize,
+
+    // ── Resource plot data (CPU %, RAM %) over time ───────────────────────────
+    plot_cpu: Vec<[f64; 2]>,   // [unix_secs, cpu_used_pct]
+    plot_ram: Vec<[f64; 2]>,   // [unix_secs, ram_used_pct]
 }
 
 impl MonitorApp {
@@ -225,6 +230,8 @@ impl MonitorApp {
                     selected_tab:  Tab::Runtime,
                     timeline:      None,
                     timeline_idx:  N_BUCKETS - 1,
+                    plot_cpu:      Vec::new(),
+                    plot_ram:      Vec::new(),
                 }
             }
             Err(e) => Self {
@@ -256,6 +263,8 @@ impl MonitorApp {
                 selected_tab:  Tab::Runtime,
                 timeline:      None,
                 timeline_idx:  N_BUCKETS - 1,
+                plot_cpu:      Vec::new(),
+                plot_ram:      Vec::new(),
             },
         };
         app.refresh_processes(None);
@@ -404,6 +413,37 @@ impl MonitorApp {
         self.timeline = Some(Timeline { buckets, t_start, t_end });
         if was_live { self.timeline_idx = N_BUCKETS - 1; }
         // else keep the existing historical position
+
+        self.build_plot_data();
+    }
+
+    /// Scan system log files and build CPU % / RAM % time-series for the plot.
+    fn build_plot_data(&mut self) {
+        let base = match &self.config {
+            Ok(cfg) => cfg.monitors.system_monitor.log_file.clone(),
+            Err(_)  => "sys_resources.jsonl".to_string(),
+        };
+        let mut cpu_pts: Vec<[f64; 2]> = Vec::new();
+        let mut ram_pts: Vec<[f64; 2]> = Vec::new();
+        for path in find_all_logs(&self.log_dir, &base) {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                for line in content.lines() {
+                    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+                    if v.get("event").and_then(|e| e.as_str()) != Some("system_resource_sample") { continue; }
+                    let Some(ts) = parse_ts_secs(&v) else { continue };
+                    let cpu     = v.get("cpu_used_percent") .and_then(|x| x.as_f64()).unwrap_or(0.0);
+                    let total   = v.get("memory_total_mb")  .and_then(|x| x.as_f64()).unwrap_or(1.0);
+                    let used    = v.get("memory_used_mb")   .and_then(|x| x.as_f64()).unwrap_or(0.0);
+                    let ram_pct = if total > 0.0 { used / total * 100.0 } else { 0.0 };
+                    cpu_pts.push([ts, cpu]);
+                    ram_pts.push([ts, ram_pct]);
+                }
+            }
+        }
+        cpu_pts.sort_by(|a, b| a[0].partial_cmp(&b[0]).unwrap_or(std::cmp::Ordering::Equal));
+        ram_pts.sort_by(|a, b| a[0].partial_cmp(&b[0]).unwrap_or(std::cmp::Ordering::Equal));
+        self.plot_cpu = cpu_pts;
+        self.plot_ram = ram_pts;
     }
 
     // ── Data refresh ──────────────────────────────────────────────────────────
@@ -760,6 +800,37 @@ impl eframe::App for MonitorApp {
                             self.refresh_system(cut);
                             self.refresh_streams(cut);
                             if self.is_live() { self.build_timeline(); }
+                        }
+
+                        // ── Resource plot ──────────────────────────────────────
+                        if !self.plot_cpu.is_empty() || !self.plot_ram.is_empty() {
+                            let cutoff = self.selected_cutoff_ts();
+                            let cpu_pts: Vec<[f64; 2]> = self.plot_cpu.iter()
+                                .filter(|p| cutoff.map_or(true, |c| p[0] <= c))
+                                .copied().collect();
+                            let ram_pts: Vec<[f64; 2]> = self.plot_ram.iter()
+                                .filter(|p| cutoff.map_or(true, |c| p[0] <= c))
+                                .copied().collect();
+
+                            egui_plot::Plot::new("resource_plot")
+                                .height(120.0)
+                                .include_y(0.0)
+                                .include_y(100.0)
+                                .x_axis_formatter(|mark, _range| fmt_bucket_time(mark.value))
+                                .y_axis_formatter(|mark, _range| format!("{:.0}%", mark.value))
+                                .legend(egui_plot::Legend::default().position(egui_plot::Corner::LeftTop))
+                                .show(ui, |plot_ui| {
+                                    plot_ui.line(
+                                        egui_plot::Line::new(egui_plot::PlotPoints::new(cpu_pts))
+                                            .color(egui::Color32::from_rgb(80, 180, 80))
+                                            .name("CPU"),
+                                    );
+                                    plot_ui.line(
+                                        egui_plot::Line::new(egui_plot::PlotPoints::new(ram_pts))
+                                            .color(egui::Color32::from_rgb(100, 150, 230))
+                                            .name("RAM"),
+                                    );
+                                });
                         }
 
                         ui.add_space(8.0);
