@@ -202,11 +202,13 @@ struct MonitorApp {
     // ── Resource plot ─────────────────────────────────────────────────────────
     /// All collected time-series. Keys: "cpu", "ram", "swap",
     /// "net:{iface}:rx", "net:{iface}:tx", "disk:{path}:rd", "disk:{path}:wr",
-    /// "gpu:{name}:util"
+    /// "gpu:{name}:util", "proc:{pid}:cpu", etc.
     plot_series:   HashMap<String, Vec<[f64; 2]>>,
     /// Checkbox keys currently selected for display. Uses the "group" key
     /// (e.g. "net:eth0") which maps to one or more series keys.
     plot_selected: HashSet<String>,
+    /// PID of the process whose metrics are shown as chart checkboxes.
+    selected_proc_pid: Option<u32>,
 }
 
 impl MonitorApp {
@@ -250,8 +252,9 @@ impl MonitorApp {
                     selected_tab:  Tab::Runtime,
                     timeline:      None,
                     timeline_idx:  N_BUCKETS - 1,
-                    plot_series:   HashMap::new(),
-                    plot_selected: ["cpu".to_string(), "ram".to_string()].into_iter().collect(),
+                    plot_series:       HashMap::new(),
+                    plot_selected:     ["cpu".to_string(), "ram".to_string()].into_iter().collect(),
+                    selected_proc_pid: None,
                 }
             }
             Err(e) => Self {
@@ -283,8 +286,9 @@ impl MonitorApp {
                 selected_tab:  Tab::Runtime,
                 timeline:      None,
                 timeline_idx:  N_BUCKETS - 1,
-                plot_series:   HashMap::new(),
-                plot_selected: ["cpu".to_string(), "ram".to_string()].into_iter().collect(),
+                plot_series:       HashMap::new(),
+                plot_selected:     ["cpu".to_string(), "ram".to_string()].into_iter().collect(),
+                selected_proc_pid: None,
             },
         };
         app.refresh_processes(None);
@@ -534,6 +538,48 @@ impl MonitorApp {
                 }
             }
         }
+        // Process metrics (cpu, mem, pagefile, I/O)
+        let proc_base = match &self.config {
+            Ok(cfg) => cfg.monitors.process_monitor.log_file.clone(),
+            Err(_)  => "proc_resources.jsonl".to_string(),
+        };
+        for path in find_all_logs(&self.log_dir, &proc_base) {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                for line in content.lines() {
+                    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+                    match v.get("event").and_then(|e| e.as_str()).unwrap_or("") {
+                        "resource_sample" => {
+                            let Some(ts) = parse_ts_secs(&v) else { continue };
+                            if let Some(procs) = v.get("processes").and_then(|p| p.as_array()) {
+                                for p in procs {
+                                    let pid    = val_u32(p, "pid");
+                                    let cpu    = p.get("cpu_percent") .and_then(|x| x.as_f64()).unwrap_or(0.0);
+                                    let mem    = p.get("memory_mb")  .and_then(|x| x.as_f64()).unwrap_or(0.0);
+                                    let pgfile = p.get("pagefile_mb").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                                    series.entry(format!("proc:{pid}:cpu"))   .or_default().push([ts, cpu]);
+                                    series.entry(format!("proc:{pid}:mem"))   .or_default().push([ts, mem]);
+                                    series.entry(format!("proc:{pid}:pgfile")).or_default().push([ts, pgfile]);
+                                }
+                            }
+                        }
+                        "io_sample" => {
+                            let Some(ts) = parse_ts_secs(&v) else { continue };
+                            if let Some(procs) = v.get("processes").and_then(|p| p.as_array()) {
+                                for p in procs {
+                                    let pid = val_u32(p, "pid");
+                                    let rd  = p.get("io_read_mb_per_sec") .and_then(|x| x.as_f64()).unwrap_or(0.0);
+                                    let wr  = p.get("io_write_mb_per_sec").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                                    series.entry(format!("proc:{pid}:rd")).or_default().push([ts, rd]);
+                                    series.entry(format!("proc:{pid}:wr")).or_default().push([ts, wr]);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
         for pts in series.values_mut() {
             pts.sort_by(|a, b| a[0].partial_cmp(&b[0]).unwrap_or(std::cmp::Ordering::Equal));
         }
@@ -984,6 +1030,28 @@ impl eframe::App for MonitorApp {
                                             ci += 1;
                                         }
                                     }
+                                    s if s.starts_with("proc:") => {
+                                        // key format: "proc:{pid}:{metric}"
+                                        let parts: Vec<&str> = s.splitn(3, ':').collect();
+                                        if parts.len() == 3 {
+                                            let pid: u32 = parts[1].parse().unwrap_or(0);
+                                            let metric   = parts[2];
+                                            let name = self.proc_rows.iter()
+                                                .find(|r| r.pid == pid)
+                                                .map(|r| r.name.as_str())
+                                                .unwrap_or("?");
+                                            let unit = match metric {
+                                                "cpu"    => "CPU %",
+                                                "mem"    => "Mem MB",
+                                                "pgfile" => "Pgfile MB",
+                                                "rd"     => "RD MB/s",
+                                                "wr"     => "WR MB/s",
+                                                other    => other,
+                                            };
+                                            lines.push((s.to_string(), format!("{name} ({pid}) {unit}"), c0));
+                                            ci += 1;
+                                        }
+                                    }
                                     _ => {}
                                 }
                             }
@@ -994,7 +1062,6 @@ impl eframe::App for MonitorApp {
                                     .height(140.0)
                                     .include_y(0.0)
                                     .x_axis_formatter(|mark, _range| fmt_bucket_time(mark.value))
-                                    .legend(egui_plot::Legend::default().position(egui_plot::Corner::LeftTop))
                                     .show(ui, |plot_ui| {
                                         for (series_key, label, color) in &lines {
                                             if let Some(all_pts) = self.plot_series.get(series_key) {
@@ -1011,6 +1078,18 @@ impl eframe::App for MonitorApp {
                                             }
                                         }
                                     });
+                                // Custom legend below the plot — full width, wraps to next line
+                                ui.add_space(2.0);
+                                ui.horizontal_wrapped(|ui| {
+                                    for (_, label, color) in &lines {
+                                        ui.add(egui::Label::new(
+                                            egui::RichText::new(format!("■ {label}"))
+                                                .color(*color)
+                                                .small()
+                                        ));
+                                        ui.add_space(6.0);
+                                    }
+                                });
                             }
                         }
 
@@ -1047,6 +1126,7 @@ impl eframe::App for MonitorApp {
                                     ui.end_row();
                                 });
                             ui.separator();
+                            let mut pending_sel: Option<Option<u32>> = None;
                             egui::ScrollArea::vertical()
                                 .id_salt("proc_scroll")
                                 .max_height(200.0)
@@ -1055,8 +1135,16 @@ impl eframe::App for MonitorApp {
                                         .num_columns(10).spacing([12.0, 4.0]).striped(true)
                                         .show(ui, |ui| {
                                             for row in &self.proc_rows {
-                                                let color = if row.alive { egui::Color32::WHITE } else { egui::Color32::GRAY };
-                                                ui.label(egui::RichText::new(&row.name).color(color));
+                                                let is_sel = self.selected_proc_pid == Some(row.pid);
+                                                let color  = if row.alive { egui::Color32::WHITE } else { egui::Color32::GRAY };
+                                                let name_text = egui::RichText::new(&row.name)
+                                                    .color(if is_sel { egui::Color32::YELLOW } else { color });
+                                                if ui.selectable_label(is_sel, name_text)
+                                                    .on_hover_text("Click to select for chart")
+                                                    .clicked()
+                                                {
+                                                    pending_sel = Some(if is_sel { None } else { Some(row.pid) });
+                                                }
                                                 ui.label(egui::RichText::new(row.pid.to_string()).color(color));
                                                 if row.alive {
                                                     ui.label(egui::RichText::new(format!("{:.1}", row.cpu_percent)).color(color))
@@ -1081,6 +1169,41 @@ impl eframe::App for MonitorApp {
                                             }
                                         });
                                 });
+                            if let Some(s) = pending_sel { self.selected_proc_pid = s; }
+
+                            // ── Process chart metrics (shown when a row is selected) ──
+                            if let Some(pid) = self.selected_proc_pid {
+                                let proc_name = self.proc_rows.iter()
+                                    .find(|r| r.pid == pid)
+                                    .map(|r| r.name.clone())
+                                    .unwrap_or_else(|| format!("PID {pid}"));
+                                ui.add_space(6.0);
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new("Chart metrics for ").small());
+                                    ui.label(egui::RichText::new(&proc_name).strong().small().color(egui::Color32::YELLOW));
+                                    ui.label(egui::RichText::new(" — click row again to deselect").small().color(egui::Color32::GRAY));
+                                });
+                                ui.horizontal(|ui| {
+                                    let metrics: &[(&str, &str)] = &[
+                                        ("cpu",    "CPU %"),
+                                        ("mem",    "Mem MB"),
+                                        ("pgfile", "Pgfile MB"),
+                                        ("rd",     "RD MB/s"),
+                                        ("wr",     "WR MB/s"),
+                                    ];
+                                    for (suffix, label) in metrics {
+                                        let key = format!("proc:{pid}:{suffix}");
+                                        let mut sel = self.plot_selected.contains(&key);
+                                        if ui.checkbox(&mut sel, *label)
+                                            .on_hover_text("Show in chart")
+                                            .changed()
+                                        {
+                                            if sel { self.plot_selected.insert(key); }
+                                            else   { self.plot_selected.remove(&format!("proc:{pid}:{suffix}")); }
+                                        }
+                                    }
+                                });
+                            }
                         }
 
                         // ── System Resources ───────────────────────────────────
