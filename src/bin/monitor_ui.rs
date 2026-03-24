@@ -552,11 +552,15 @@ impl MonitorApp {
                             let Some(ts) = parse_ts_secs(&v) else { continue };
                             if let Some(procs) = v.get("processes").and_then(|p| p.as_array()) {
                                 for p in procs {
-                                    let pid    = val_u32(p, "pid");
-                                    let cpu    = p.get("cpu_percent") .and_then(|x| x.as_f64()).unwrap_or(0.0);
-                                    let mem    = p.get("memory_mb")  .and_then(|x| x.as_f64()).unwrap_or(0.0);
-                                    let pgfile = p.get("pagefile_mb").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                                    let pid     = val_u32(p, "pid");
+                                    let cpu     = p.get("cpu_percent")        .and_then(|x| x.as_f64()).unwrap_or(0.0);
+                                    let cpu_k   = p.get("cpu_kernel_percent") .and_then(|x| x.as_f64()).unwrap_or(0.0);
+                                    let cpu_u   = p.get("cpu_user_percent")   .and_then(|x| x.as_f64()).unwrap_or(0.0);
+                                    let mem     = p.get("memory_mb")          .and_then(|x| x.as_f64()).unwrap_or(0.0);
+                                    let pgfile  = p.get("pagefile_mb")        .and_then(|x| x.as_f64()).unwrap_or(0.0);
                                     series.entry(format!("proc:{pid}:cpu"))   .or_default().push([ts, cpu]);
+                                    series.entry(format!("proc:{pid}:cpu_k")) .or_default().push([ts, cpu_k]);
+                                    series.entry(format!("proc:{pid}:cpu_u")) .or_default().push([ts, cpu_u]);
                                     series.entry(format!("proc:{pid}:mem"))   .or_default().push([ts, mem]);
                                     series.entry(format!("proc:{pid}:pgfile")).or_default().push([ts, pgfile]);
                                 }
@@ -1041,6 +1045,8 @@ impl eframe::App for MonitorApp {
                                                 .unwrap_or("?");
                                             let unit = match metric {
                                                 "cpu"    => "CPU %",
+                                                "cpu_k"  => "Kernel %",
+                                                "cpu_u"  => "User %",
                                                 "mem"    => "Mem MB",
                                                 "pgfile" => "Pgfile MB",
                                                 "rd"     => "RD MB/s",
@@ -1129,9 +1135,9 @@ impl eframe::App for MonitorApp {
                                 .color(egui::Color32::GRAY));
                         } else {
                             egui::Grid::new("proc_header")
-                                .num_columns(10).spacing([12.0, 2.0])
+                                .num_columns(12).spacing([12.0, 2.0])
                                 .show(ui, |ui| {
-                                    for label in ["Name", "PID", "CPU %", "Mem MB", "Pgfile MB", "RD MB/s", "WR MB/s", "Handles", "Threads", "Last seen"] {
+                                    for label in ["Name", "PID", "CPU %", "K %", "U %", "Mem MB", "Pgfile MB", "RD MB/s", "WR MB/s", "Handles", "Threads", "Last seen"] {
                                         ui.label(egui::RichText::new(label).strong().small());
                                     }
                                     ui.end_row();
@@ -1143,7 +1149,7 @@ impl eframe::App for MonitorApp {
                                 .max_height(200.0)
                                 .show(ui, |ui| {
                                     egui::Grid::new("proc_table")
-                                        .num_columns(10).spacing([12.0, 4.0]).striped(true)
+                                        .num_columns(12).spacing([12.0, 4.0]).striped(true)
                                         .show(ui, |ui| {
                                             for row in &self.proc_rows {
                                                 let is_sel = self.selected_proc_pid == Some(row.pid);
@@ -1158,11 +1164,9 @@ impl eframe::App for MonitorApp {
                                                 }
                                                 ui.label(egui::RichText::new(row.pid.to_string()).color(color));
                                                 if row.alive {
-                                                    ui.label(egui::RichText::new(format!("{:.1}", row.cpu_percent)).color(color))
-                                                        .on_hover_text(format!(
-                                                            "kernel: {:.1}%  user: {:.1}%",
-                                                            row.cpu_kernel_percent, row.cpu_user_percent
-                                                        ));
+                                                    ui.label(egui::RichText::new(format!("{:.1}", row.cpu_percent)).color(color));
+                                                    ui.label(egui::RichText::new(format!("{:.1}", row.cpu_kernel_percent)).color(color));
+                                                    ui.label(egui::RichText::new(format!("{:.1}", row.cpu_user_percent)).color(color));
                                                     ui.label(egui::RichText::new(format!("{:.1}", row.memory_mb)).color(color));
                                                     ui.label(egui::RichText::new(format!("{:.1}", row.pagefile_mb)).color(color));
                                                     ui.label(egui::RichText::new(format!("{:.2}", row.io_read_mb_s)).color(color));
@@ -1170,7 +1174,7 @@ impl eframe::App for MonitorApp {
                                                     ui.label(egui::RichText::new(row.handles.to_string()).color(color));
                                                     ui.label(egui::RichText::new(row.threads.to_string()).color(color));
                                                 } else {
-                                                    for _ in 0..7 {
+                                                    for _ in 0..9 {
                                                         ui.label(egui::RichText::new("—").color(egui::Color32::GRAY));
                                                     }
                                                 }
@@ -1197,6 +1201,8 @@ impl eframe::App for MonitorApp {
                                 ui.horizontal(|ui| {
                                     let metrics: &[(&str, &str)] = &[
                                         ("cpu",    "CPU %"),
+                                        ("cpu_k",  "Kernel %"),
+                                        ("cpu_u",  "User %"),
                                         ("mem",    "Mem MB"),
                                         ("pgfile", "Pgfile MB"),
                                         ("rd",     "RD MB/s"),
