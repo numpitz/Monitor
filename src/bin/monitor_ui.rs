@@ -814,11 +814,10 @@ impl eframe::App for MonitorApp {
             ui.add_space(4.0);
 
             // ── Tab content ───────────────────────────────────────────────────
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                match self.selected_tab {
+            match self.selected_tab {
 
-                    // ══════════════════════════════════════════════════════════
-                    Tab::Runtime => {
+                // ══════════════════════════════════════════════════════════
+                Tab::Runtime => {
                         // ── Timeline heatmap ───────────────────────────────────
                         let tl_clone = self.timeline.clone();
                         let mut new_timeline_idx: Option<usize> = None;
@@ -1095,6 +1094,10 @@ impl eframe::App for MonitorApp {
 
                         ui.add_space(8.0);
                         ui.separator();
+
+                        egui::ScrollArea::vertical()
+                            .id_salt("runtime_scroll")
+                            .show(ui, |ui| {
 
                         // ── Watched Processes ──────────────────────────────────
                         ui.add_space(6.0);
@@ -1573,10 +1576,14 @@ impl eframe::App for MonitorApp {
                                         });
                                 });
                         }
+                        }); // runtime_scroll
                     } // Tab::Runtime
 
                     // ══════════════════════════════════════════════════════════
                     Tab::Configuration => {
+                        egui::ScrollArea::vertical()
+                            .id_salt("config_scroll")
+                            .show(ui, |ui| {
                         if let Err(ref msg) = self.config {
                             ui.colored_label(egui::Color32::RED, format!("Cannot load config: {msg}"));
                             return;
@@ -1719,10 +1726,10 @@ impl eframe::App for MonitorApp {
                                 ui.colored_label(egui::Color32::GREEN, format!("  ✓  {}", self.status));
                             }
                         });
+                        }); // config_scroll
                     } // Tab::Configuration
 
-                } // match
-            }); // ScrollArea
+            } // match
         }); // CentralPanel
     }
 }
