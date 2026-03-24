@@ -105,6 +105,12 @@ pub struct ProcessMonitorConfig {
     #[serde(default = "default_min_tick_ms")]
     pub min_tick_ms: u64,
 
+    /// How often to sample per-process I/O counters (milliseconds).
+    /// Uses a separate, slower interval because GetProcessIoCounters adds one
+    /// extra API call per tracked process. Set to 0 to disable.
+    #[serde(default = "default_io_poll_ms")]
+    pub io_poll_interval_ms: u64,
+
     /// Absolute paths. Every .exe found here is watched by name.
     pub watch_folders: Vec<String>,
 
@@ -115,13 +121,14 @@ pub struct ProcessMonitorConfig {
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ProcessMonitorLogConfig {
-    #[serde(default = "yes")] pub cpu_percent:   bool,
-    #[serde(default = "yes")] pub memory_mb:     bool,
-    #[serde(default = "yes")] pub handle_count:  bool,
-    #[serde(default = "yes")] pub thread_count:  bool,
-    #[serde(default = "yes")] pub process_spawn: bool,
-    #[serde(default = "yes")] pub process_exit:  bool,
-    #[serde(default = "yes")] pub snapshot:      bool,
+    #[serde(default = "yes")] pub cpu_percent:    bool,
+    #[serde(default = "yes")] pub memory_mb:      bool,
+    #[serde(default = "yes")] pub handle_count:   bool,
+    #[serde(default = "yes")] pub thread_count:   bool,
+    #[serde(default = "yes")] pub process_spawn:  bool,
+    #[serde(default = "yes")] pub process_exit:   bool,
+    #[serde(default = "yes")] pub snapshot:       bool,
+    #[serde(default = "yes")] pub io_counters:    bool,
 
     /// Emit a cpu_alert entry when a process exceeds this threshold.
     #[serde(default)]
@@ -142,6 +149,7 @@ impl Default for ProcessMonitorLogConfig {
             process_spawn:               true,
             process_exit:                true,
             snapshot:                    true,
+            io_counters:                 true,
             cpu_alert_threshold_percent: None,
             memory_alert_mb:             None,
         }
@@ -321,6 +329,7 @@ fn yes()                      -> bool   { true }
 fn default_proc_log_file()    -> String { "proc_resources.jsonl".into() }
 fn default_resource_poll_ms() -> u64    { 5_000 }
 fn default_snapshot_ms()      -> u64    { 60_000 }
+fn default_io_poll_ms()       -> u64    { 10_000 }
 fn default_sys_log_file()     -> String { "sys_resources.jsonl".into() }
 fn default_sys_poll_ms()      -> u64    { 30_000 }
 

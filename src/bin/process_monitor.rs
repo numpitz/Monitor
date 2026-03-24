@@ -169,6 +169,10 @@ fn main() -> Result<()> {
         .checked_sub(Duration::from_millis(pm.snapshot_interval_ms)) // trigger snapshot on first poll
         .unwrap_or_else(Instant::now);
 
+    let mut last_io_sample = Instant::now()
+        .checked_sub(Duration::from_millis(pm.io_poll_interval_ms)) // trigger I/O sample on first poll
+        .unwrap_or_else(Instant::now);
+
     cprint!(args.no_console, "[process-monitor] watching {} folder(s):", pm.watch_folders.len());
     for f in &pm.watch_folders {
         cprint!(args.no_console, "  {f}");
@@ -184,6 +188,7 @@ fn main() -> Result<()> {
         let log_cfg           = pm_cfg.log.clone();
         let poll_interval     = Duration::from_millis(pm_cfg.resource_poll_interval_ms);
         let snapshot_interval = Duration::from_millis(pm_cfg.snapshot_interval_ms);
+        let io_interval       = Duration::from_millis(pm_cfg.io_poll_interval_ms);
 
         // ── 1. Discover spawns / exits ────────────────────────────────────────
         match discovery.poll() {
@@ -267,7 +272,29 @@ fn main() -> Result<()> {
             }
         }
 
-        // ── 3. Snapshot (skipped when snapshot_interval_ms == 0) ─────────────
+        // ── 3. I/O sample (separate, slower interval) ────────────────────────
+        if log_cfg.io_counters
+            && pm_cfg.io_poll_interval_ms > 0
+            && last_io_sample.elapsed() >= io_interval
+        {
+            let known = discovery.known_processes();
+            if !known.is_empty() {
+                let mut io_samples = Vec::with_capacity(known.len());
+                for info in known.values() {
+                    if let Some(s) = sampler.sample_io(info.pid, &info.name) {
+                        io_samples.push(s);
+                    }
+                }
+                if !io_samples.is_empty() {
+                    send(&tx, &LogEntry::info(MONITOR, "io_sample", IoSampleData {
+                        processes: io_samples,
+                    }));
+                }
+            }
+            last_io_sample = Instant::now();
+        }
+
+        // ── 4. Snapshot (skipped when snapshot_interval_ms == 0) ─────────────
         if log_cfg.snapshot
             && pm_cfg.snapshot_interval_ms > 0
             && last_snapshot.elapsed() >= snapshot_interval
@@ -293,7 +320,7 @@ fn main() -> Result<()> {
             last_snapshot = Instant::now();
         }
 
-        // ── 4. Sleep — chunked so config changes and Ctrl-C take effect quickly ──
+        // ── 5. Sleep — chunked so config changes and Ctrl-C take effect quickly ──
         //
         // Instead of one blocking sleep for the full interval, we sleep in 500 ms
         // slices.  After each slice we check:

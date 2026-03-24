@@ -107,12 +107,32 @@ pub struct ProcessExitedData {
 /// One row in a resource_sample event.
 #[derive(Serialize)]
 pub struct ProcessSample {
-    pub pid:         u32,
-    pub name:        String,
-    pub cpu_percent: f64,
-    pub memory_mb:   f64,
-    pub handles:     u32,
-    pub threads:     u32,
+    pub pid:                u32,
+    pub name:               String,
+    pub cpu_percent:        f64,
+    pub cpu_kernel_percent: f64,
+    pub cpu_user_percent:   f64,
+    pub memory_mb:          f64,
+    pub pagefile_mb:        f64,
+    pub handles:            u32,
+    pub threads:            u32,
+}
+
+/// One row in an io_sample event.
+#[derive(Serialize)]
+pub struct IoProcessSample {
+    pub pid:                  u32,
+    pub name:                 String,
+    pub io_read_mb_per_sec:   f64,
+    pub io_write_mb_per_sec:  f64,
+    pub io_read_ops_per_sec:  f64,
+    pub io_write_ops_per_sec: f64,
+}
+
+/// Written every `io_poll_interval_ms`.
+#[derive(Serialize)]
+pub struct IoSampleData {
+    pub processes: Vec<IoProcessSample>,
 }
 
 /// Written every `resource_poll_interval_ms`.

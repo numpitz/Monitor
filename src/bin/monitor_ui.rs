@@ -45,12 +45,17 @@ fn main() -> eframe::Result<()> {
 
 #[derive(Default)]
 struct ProcessRow {
-    pid:         u32,
-    name:        String,
-    cpu_percent: f64,
-    memory_mb:   f64,
-    handles:     u32,
-    threads:     u32,
+    pid:                u32,
+    name:               String,
+    cpu_percent:        f64,
+    cpu_kernel_percent: f64,
+    cpu_user_percent:   f64,
+    memory_mb:          f64,
+    pagefile_mb:        f64,
+    handles:            u32,
+    threads:            u32,
+    io_read_mb_s:       f64,
+    io_write_mb_s:      f64,
     /// HH:MM:SS of the last resource_sample that included this process
     /// (or spawn / exit time when no sample is available).
     last_seen:   String,
@@ -591,12 +596,28 @@ impl MonitorApp {
                                 let row  = map.entry(pid).or_insert_with(|| ProcessRow {
                                     pid, name: name.clone(), alive: true, ..Default::default()
                                 });
-                                row.cpu_percent = p.get("cpu_percent").and_then(|x| x.as_f64()).unwrap_or(0.0);
-                                row.memory_mb   = p.get("memory_mb")  .and_then(|x| x.as_f64()).unwrap_or(0.0);
-                                row.handles     = p.get("handles")    .and_then(|x| x.as_u64()).unwrap_or(0) as u32;
-                                row.threads     = p.get("threads")    .and_then(|x| x.as_u64()).unwrap_or(0) as u32;
-                                row.last_seen   = sample_ts.clone();
-                                row.alive       = true;
+                                row.cpu_percent        = p.get("cpu_percent")       .and_then(|x| x.as_f64()).unwrap_or(0.0);
+                                row.cpu_kernel_percent = p.get("cpu_kernel_percent").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                                row.cpu_user_percent   = p.get("cpu_user_percent")  .and_then(|x| x.as_f64()).unwrap_or(0.0);
+                                row.memory_mb          = p.get("memory_mb")         .and_then(|x| x.as_f64()).unwrap_or(0.0);
+                                row.pagefile_mb        = p.get("pagefile_mb")       .and_then(|x| x.as_f64()).unwrap_or(0.0);
+                                row.handles            = p.get("handles")           .and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+                                row.threads            = p.get("threads")           .and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+                                row.last_seen          = sample_ts.clone();
+                                row.alive              = true;
+                            }
+                        }
+                    }
+                    "io_sample" => {
+                        if let Some(procs) = v.get("processes").and_then(|p| p.as_array()) {
+                            for p in procs {
+                                let pid  = val_u32(p, "pid");
+                                let name = val_str(p, "name");
+                                let row  = map.entry(pid).or_insert_with(|| ProcessRow {
+                                    pid, name: name.clone(), alive: true, ..Default::default()
+                                });
+                                row.io_read_mb_s  = p.get("io_read_mb_per_sec") .and_then(|x| x.as_f64()).unwrap_or(0.0);
+                                row.io_write_mb_s = p.get("io_write_mb_per_sec").and_then(|x| x.as_f64()).unwrap_or(0.0);
                             }
                         }
                     }
@@ -1018,9 +1039,9 @@ impl eframe::App for MonitorApp {
                                 .color(egui::Color32::GRAY));
                         } else {
                             egui::Grid::new("proc_header")
-                                .num_columns(7).spacing([12.0, 2.0])
+                                .num_columns(10).spacing([12.0, 2.0])
                                 .show(ui, |ui| {
-                                    for label in ["Name", "PID", "CPU %", "Mem MB", "Handles", "Threads", "Last seen"] {
+                                    for label in ["Name", "PID", "CPU %", "Mem MB", "Pgfile MB", "RD MB/s", "WR MB/s", "Handles", "Threads", "Last seen"] {
                                         ui.label(egui::RichText::new(label).strong().small());
                                     }
                                     ui.end_row();
@@ -1031,19 +1052,26 @@ impl eframe::App for MonitorApp {
                                 .max_height(200.0)
                                 .show(ui, |ui| {
                                     egui::Grid::new("proc_table")
-                                        .num_columns(7).spacing([12.0, 4.0]).striped(true)
+                                        .num_columns(10).spacing([12.0, 4.0]).striped(true)
                                         .show(ui, |ui| {
                                             for row in &self.proc_rows {
                                                 let color = if row.alive { egui::Color32::WHITE } else { egui::Color32::GRAY };
                                                 ui.label(egui::RichText::new(&row.name).color(color));
                                                 ui.label(egui::RichText::new(row.pid.to_string()).color(color));
                                                 if row.alive {
-                                                    ui.label(format!("{:.1}", row.cpu_percent));
-                                                    ui.label(format!("{:.1}", row.memory_mb));
-                                                    ui.label(row.handles.to_string());
-                                                    ui.label(row.threads.to_string());
+                                                    ui.label(egui::RichText::new(format!("{:.1}", row.cpu_percent)).color(color))
+                                                        .on_hover_text(format!(
+                                                            "kernel: {:.1}%  user: {:.1}%",
+                                                            row.cpu_kernel_percent, row.cpu_user_percent
+                                                        ));
+                                                    ui.label(egui::RichText::new(format!("{:.1}", row.memory_mb)).color(color));
+                                                    ui.label(egui::RichText::new(format!("{:.1}", row.pagefile_mb)).color(color));
+                                                    ui.label(egui::RichText::new(format!("{:.2}", row.io_read_mb_s)).color(color));
+                                                    ui.label(egui::RichText::new(format!("{:.2}", row.io_write_mb_s)).color(color));
+                                                    ui.label(egui::RichText::new(row.handles.to_string()).color(color));
+                                                    ui.label(egui::RichText::new(row.threads.to_string()).color(color));
                                                 } else {
-                                                    for _ in 0..4 {
+                                                    for _ in 0..7 {
                                                         ui.label(egui::RichText::new("—").color(egui::Color32::GRAY));
                                                     }
                                                 }
