@@ -42,11 +42,12 @@ jobs:
       - name: Collect release assets
         run: |
           New-Item -ItemType Directory -Force release-assets
-          Copy-Item target\release\monitor-watchdog.exe  release-assets\
+          Copy-Item target\release\monitor.exe           release-assets\
           Copy-Item target\release\process-monitor.exe   release-assets\
           Copy-Item target\release\system-monitor.exe    release-assets\
           Copy-Item target\release\go2rtc-monitor.exe    release-assets\
           Copy-Item target\release\monitor-ui.exe        release-assets\
+          Copy-Item target\release\filebeat.exe          release-assets\
           Copy-Item config\monitor.config.json           release-assets\
         shell: pwsh
 
