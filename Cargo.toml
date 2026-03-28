@@ -31,6 +31,10 @@ path = "src/bin/go2rtc_monitor.rs"
 name = "monitor"
 path = "src/bin/monitor.rs"
 
+[[bin]]
+name = "filebeat"
+path = "src/bin/filebeat.rs"
+
 # ── Features ──────────────────────────────────────────────────────────────────
 # Default: full Windows build (all binaries).
 # Linux / ARM headless: cargo build --no-default-features
@@ -44,6 +48,7 @@ nvidia          = ["nvml-wrapper"]   # NVIDIA GPU monitoring via NVML (requires 
 # ── cross-platform deps ───────────────────────────────────────────────────────
 [dependencies]
 anyhow               = "1"
+glob                 = "0.3"
 chrono               = { version = "0.4", features = ["serde"] }
 clap                 = { version = "4",   features = ["derive"] }
 crossbeam-channel    = "0.5"

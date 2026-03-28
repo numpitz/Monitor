@@ -79,6 +79,9 @@ pub struct MonitorsConfig {
 
     #[serde(default)]
     pub go2rtc_monitor: Go2rtcMonitorConfig,
+
+    #[serde(default)]
+    pub filebeat: FilebeatConfig,
 }
 
 // ── process-monitor ───────────────────────────────────────────────────────────
@@ -406,3 +409,49 @@ fn default_go2rtc_log_file() -> String { "go2rtc_streams.jsonl".into() }
 fn default_go2rtc_api_url()  -> String { "http://localhost:1984".into() }
 fn default_go2rtc_poll_ms()  -> u64    { 10_000 }
 fn default_min_tick_ms()     -> u64    { 500 }
+
+// ── filebeat ──────────────────────────────────────────────────────────────────
+
+/// One source entry: a folder + glob pattern to tail, with a logical name
+/// used as the output file base name in the monitor's log folder.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct FilebeatSourceConfig {
+    /// Logical name — becomes the output file base name (e.g. "myapp" → myapp.0.jsonl).
+    pub name: String,
+    /// Absolute path to the directory to scan.
+    pub folder: String,
+    /// Glob pattern for file names within the folder, e.g. `"*.log"`.
+    pub pattern: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct FilebeatConfig {
+    /// Disabled by default — only needed when external app logs must be forwarded.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// How often to scan source folders for new log content (milliseconds).
+    #[serde(default = "default_filebeat_poll_ms")]
+    pub poll_interval_ms: u64,
+
+    /// Granularity of the sleep loop — see ProcessMonitorConfig for details.
+    #[serde(default = "default_min_tick_ms")]
+    pub min_tick_ms: u64,
+
+    /// List of source folders and patterns to forward into the log folder.
+    #[serde(default)]
+    pub sources: Vec<FilebeatSourceConfig>,
+}
+
+impl Default for FilebeatConfig {
+    fn default() -> Self {
+        Self {
+            enabled:          false,
+            poll_interval_ms: default_filebeat_poll_ms(),
+            min_tick_ms:      default_min_tick_ms(),
+            sources:          Vec::new(),
+        }
+    }
+}
+
+fn default_filebeat_poll_ms() -> u64 { 5_000 }

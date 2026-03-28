@@ -371,3 +371,56 @@ pub struct ConsumerChangeData {
     pub consumer_count: usize,
     pub previous_count: usize,
 }
+
+// ── filebeat event data ───────────────────────────────────────────────────────
+
+/// A raw line forwarded from an external log file.
+/// The `line` field holds the verbatim original content.
+#[derive(Serialize)]
+pub struct LogLineData {
+    pub source_name: String,
+    /// File name only (not the full path).
+    pub source_file: String,
+    /// Raw, unmodified line content from the source log file.
+    pub line:        String,
+}
+
+/// Emitted after each poll when at least one line was forwarded from a file.
+#[derive(Serialize)]
+pub struct FilebeatForwardedData {
+    pub source_name:     String,
+    /// File name only (not the full path).
+    pub source_file:     String,
+    /// Number of lines forwarded in this poll.
+    pub lines_forwarded: u64,
+}
+
+/// Emitted when a source file shrank below the last known offset,
+/// indicating the file was rotated or truncated.
+#[derive(Serialize)]
+pub struct FilebeatRotationData {
+    pub source_name: String,
+    /// File name only (not the full path).
+    pub source_file: String,
+    /// Byte offset at the time the rotation was detected (before reset to 0).
+    pub previous_offset: u64,
+    /// 0-based line index of the last line forwarded before the rotation.
+    pub last_line_index: u64,
+}
+
+/// Emitted when a source file reappears after having been absent.
+/// The `event` field distinguishes the sub-case:
+///   `file_appeared_same_state` — file is at the exact same offset, no re-read needed.
+///   `file_appeared_empty`      — file exists but is empty; reading will resume from 0.
+///   `file_appeared_resumed`    — last forwarded line was found; reading resumes after it.
+///   `file_appeared_no_match`   — last line hash not found; reading starts from the beginning.
+#[derive(Serialize)]
+pub struct FilebeatFileAppearedData {
+    pub source_name: String,
+    /// File name only (not the full path).
+    pub source_file: String,
+    /// 0-based line index of the last line forwarded before the file disappeared.
+    pub last_line_index: u64,
+    /// Byte offset at which reading will resume.
+    pub resumed_at_offset: u64,
+}

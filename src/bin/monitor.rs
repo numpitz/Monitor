@@ -222,6 +222,7 @@ fn main() -> Result<()> {
         ManagedChild::monitor("process-monitor", "process-monitor"),
         ManagedChild::monitor("system-monitor",  "system-monitor"),
         ManagedChild::monitor("go2rtc-monitor",  "go2rtc-monitor"),
+        ManagedChild::monitor("filebeat",         "filebeat"),
         #[cfg(feature = "monitor_ui")]
         ManagedChild::gui    ("monitor-ui",       "monitor-ui"),
     ];
@@ -247,6 +248,7 @@ fn main() -> Result<()> {
             monitors_cfg.process_monitor.enabled,
             monitors_cfg.system_monitor.enabled,
             monitors_cfg.go2rtc_monitor.enabled,
+            monitors_cfg.filebeat.enabled,
             #[cfg(feature = "monitor_ui")]
             true, // monitor-ui: always start when built
         ];

@@ -21,6 +21,7 @@ Rust has no classes. Structs hold data, `impl` blocks hold methods — like a cl
 | [src/events.rs:22-28](src/events.rs#L22-L28) | Simple enum — like Java/Kotlin enums |
 | [src/sampler.rs:52-58](src/sampler.rs#L52-L58) | `impl` block with a constructor `new()` — Rust has no `new` keyword, it is just a convention |
 | [src/writer.rs:36-46](src/writer.rs#L36-L46) | Struct with private fields — same visibility rules as C#/Java |
+| [src/bin/filebeat.rs:120-140](src/bin/filebeat.rs#L120-L140) | `#[serde(default)]` on individual fields — lets you add new fields to a persisted JSON struct without breaking existing state files that predate the field |
 
 ---
 
@@ -96,6 +97,7 @@ The `anyhow` crate (used throughout) simplifies this for applications.
 | [src/discovery.rs:81](src/discovery.rs#L81) | `?` operator — early return on error, like `try`/`throw` but explicit at the call site |
 | [src/discovery.rs:92-96](src/discovery.rs#L92-L96) | `.ok()?` — converts `Result` to `Option` then propagates `None` |
 | [src/writer.rs:234](src/writer.rs#L234) | `let _ = std::fs::remove_file(path)` — explicitly ignoring an error |
+| [src/bin/filebeat.rs](src/bin/filebeat.rs) `save_state` | `let _ = std::fs::write(...)` — same pattern: state persistence is best-effort; a write failure is not worth crashing the monitor |
 
 **[src/config.rs:42-47](src/config.rs#L42-L47)** — wrapping errors with context, like chaining exceptions:
 ```rust
@@ -113,6 +115,8 @@ but closures interact with the ownership system.
 |---|---|
 | [src/discovery.rs:132-135](src/discovery.rs#L132-L135) | `.keys().filter(...).copied().collect()` — chained adapters like LINQ |
 | [src/bin/system_monitor.rs:733-760](src/bin/system_monitor.rs#L733-L760) | `msg_fn: impl Fn(f64, f64) -> String` — passing a function as a parameter |
+| [src/bin/filebeat.rs](src/bin/filebeat.rs) `poll_sources` | `paths.flatten()` on a glob iterator — `.flatten()` discards `Err` entries from the iterator, leaving only successful path matches |
+| [src/bin/filebeat.rs](src/bin/filebeat.rs) `poll_sources` | `state.files.entry(key).or_insert(...)` — `HashMap::entry` API: get the value if it exists, insert a default if it does not, all in one step. Like `ConcurrentDictionary.GetOrAdd()` in C# |
 
 **[src/discovery.rs:161-163](src/discovery.rs#L161-L163)** — basic iterator with a closure predicate:
 ```rust
@@ -126,7 +130,57 @@ but closures interact with the ownership system.
 
 ---
 
-### Stage 8 — Concurrency
+### Stage 8 — Practical Patterns: Persistent State and Hashing
+
+`src/bin/filebeat.rs` is a good self-contained example of patterns that appear repeatedly in
+real-world Rust services.
+
+**Persisting state to a JSON file** — save/load without a database:
+
+```rust
+fn load_state(log_dir: &Path) -> ForwarderState {
+    std::fs::read_to_string(path)
+        .ok()                                  // Result → Option (None on any I/O error)
+        .and_then(|s| serde_json::from_str(&s).ok())   // parse; None on bad JSON
+        .unwrap_or_default()                   // fall back to empty state
+}
+```
+
+The chain `ok().and_then(...).unwrap_or_default()` is idiomatic Rust for
+"try this, and if anything goes wrong just use the zero value" — no try/catch, no if-chains.
+See [src/bin/filebeat.rs](src/bin/filebeat.rs) `load_state`.
+
+**Content fingerprinting with `DefaultHasher`** — identifying a line of text cheaply:
+
+```rust
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
+fn hash_str(s: &str) -> u64 {
+    let mut h = DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+```
+
+`DefaultHasher` lives in `std` — no external crate needed for a simple content hash.
+The `Hash` trait (auto-derived on most standard types) does the work; `Hasher` accumulates
+the result.  See [src/bin/filebeat.rs](src/bin/filebeat.rs) `hash_str` and `find_line_by_hash`.
+
+**Environment variable expansion** — `std::env::var` returns `Result<String, VarError>`, so
+chaining `.or_else` lets you try fallback names without nesting:
+
+```rust
+std::env::var(var_name)
+    .or_else(|_| std::env::var(var_name.to_uppercase()))
+    .unwrap_or_else(|_| format!("%{var_name}%"))
+```
+
+See [src/bin/filebeat.rs](src/bin/filebeat.rs) `expand_env_vars`.
+
+---
+
+### Stage 10 — Concurrency
 
 Rust's ownership system makes data races a **compile error**, not a runtime crash.
 
@@ -139,7 +193,7 @@ Rust's ownership system makes data races a **compile error**, not a runtime cras
 
 ---
 
-### Stage 9 — Macros
+### Stage 11 — Macros
 
 Two kinds: **declarative** (`macro_rules!`) and **procedural** (`#[derive(...)]`). The project uses both.
 
@@ -151,7 +205,7 @@ Two kinds: **declarative** (`macro_rules!`) and **procedural** (`#[derive(...)]`
 
 ---
 
-### Stage 10 — Unsafe and FFI (Windows API)
+### Stage 12 — Unsafe and FFI (Windows API)
 
 The advanced section. Rust's safety guarantees are opt-out with `unsafe`.
 This project uses it to call Windows APIs directly.
@@ -188,6 +242,9 @@ path = "src/bin/process_monitor.rs"
 [[bin]]
 name = "system-monitor"            ← produces system-monitor.exe
 ...
+[[bin]]
+name = "filebeat"                  ← produces filebeat.exe
+path = "src/bin/filebeat.rs"
 ```
 
 [Cargo.toml:8-30](Cargo.toml#L8-L30)
@@ -364,6 +421,7 @@ Cargo.toml
     ├── system_monitor.rs         → system-monitor   (all platforms)
     ├── monitor_ui.rs             → monitor-ui       (feature: monitor_ui — GUI targets)
     ├── go2rtc_monitor.rs         → go2rtc-monitor   (all platforms)
+    ├── filebeat.rs               → filebeat         (all platforms)
     └── monitor.rs                → monitor          (all platforms)
 ```
 
@@ -381,11 +439,16 @@ source tree, sharing one dependency graph and one compiler invocation.
 3.  src/lib.rs                 macros, channels, closures, shared utilities
 4.  src/writer.rs              ownership, mut borrowing, file I/O
 5.  src/discovery.rs           iterators, pattern matching, error handling
-6.  src/bin/process_monitor.rs threads, Arc/RwLock, channels
-7.  src/bin/system_monitor.rs  large real-world integration of all the above
-8.  src/sampler.rs             unsafe, Windows FFI
-9.  src/pdh_disk.rs            advanced unsafe, Drop trait
-10. src/pdh_gpu.rs             raw memory allocation, pointer arithmetic
+6.  src/bin/go2rtc_monitor.rs  straightforward real-world binary: HTTP polling, channels, hot-reload
+7.  src/bin/filebeat.rs        persistent JSON state, HashMap::entry, hashing, env-var expansion
+8.  src/bin/process_monitor.rs threads, Arc/RwLock, channels
+9.  src/bin/system_monitor.rs  large real-world integration of all the above
+10. src/sampler.rs             unsafe, Windows FFI
+11. src/pdh_disk.rs            advanced unsafe, Drop trait
+12. src/pdh_gpu.rs             raw memory allocation, pointer arithmetic
 ```
 
 Start with [src/config.rs](src/config.rs) — coming from C#/Kotlin it will feel immediately readable.
+`src/bin/filebeat.rs` is a good second binary to read after `go2rtc_monitor.rs` — it introduces
+persistent state and content hashing using only `std`, and all the logic is straightforward
+sequential file I/O with no platform-specific code.

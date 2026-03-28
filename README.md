@@ -11,6 +11,7 @@ All binaries share one `monitor.config.json` and write their own NDJSON log file
 | `process-monitor` | Per-process CPU, RAM, handles, spawn/exit events | `proc_resources.jsonl` | Windows only |
 | `system-monitor` | System-wide CPU, RAM, swap, disk, network, GPU | `sys_resources.jsonl` | all |
 | `go2rtc-monitor` | go2rtc stream state — producers, consumers, up/down events | `go2rtc_streams.jsonl` | all |
+| `filebeat` | Tails external log files into the monitor log folder | `filebeat.jsonl` + per-source | all |
 | `monitor-ui` | egui desktop app — live config editor and resource viewer | — | GUI targets only |
 
 ---
@@ -37,6 +38,7 @@ monitor.exe
 process-monitor.exe
 system-monitor.exe
 go2rtc-monitor.exe
+filebeat.exe
 monitor-ui.exe
 ```
 
@@ -46,7 +48,7 @@ Components that require Windows APIs are excluded via Cargo feature flags.
 
 | Build command | Binaries produced | Use case |
 |--------------|-------------------|----------|
-| `cargo build --no-default-features` | `monitor`, `system-monitor`, `go2rtc-monitor` | Headless server / Raspberry Pi |
+| `cargo build --no-default-features` | `monitor`, `system-monitor`, `go2rtc-monitor`, `filebeat` | Headless server / Raspberry Pi |
 | `cargo build --no-default-features --features monitor_ui` | + `monitor-ui` | Linux desktop with display |
 
 ```bash
@@ -65,6 +67,7 @@ cargo build --release --no-default-features --features monitor_ui
 | `process-monitor` | ✓ | — | — | Uses Win32 APIs; excluded from non-Windows builds |
 | `system-monitor` | ✓ | ✓ | ✓ | GPU and disk I/O metrics are Windows-only; CPU/RAM/network work everywhere |
 | `go2rtc-monitor` | ✓ | ✓ | ✓ | Pure HTTP — no platform-specific code |
+| `filebeat` | ✓ | ✓ | ✓ | Pure Rust file I/O — no platform-specific code |
 | `monitor-ui` | ✓ | ✓ | ✓ | Requires a display (X11/Wayland); exclude with `--no-default-features` on headless targets |
 
 No runtime dependencies — each binary ships as a single file.
@@ -114,11 +117,13 @@ no restart required.
 process-monitor.exe C:\monitor\
 system-monitor.exe  C:\monitor\
 go2rtc-monitor.exe  C:\monitor\
+filebeat.exe        C:\monitor\
 
 # Windows — detached, no window
 process-monitor.exe C:\monitor\ --no-console
 system-monitor.exe  C:\monitor\ --no-console
 go2rtc-monitor.exe  C:\monitor\ --no-console
+filebeat.exe        C:\monitor\ --no-console
 
 # Configuration UI (started automatically by the supervisor — only needed here
 # when running monitors individually)
@@ -129,6 +134,7 @@ monitor-ui.exe C:\monitor\
 # Linux / ARM
 ./system-monitor  /var/monitor/
 ./go2rtc-monitor  /var/monitor/
+./filebeat        /var/monitor/
 ./monitor-ui      /var/monitor/   # only if built with --features monitor_ui
 ```
 
@@ -138,7 +144,7 @@ The UI writes changes atomically.
 
 | Component | Picks up config changes within… |
 |-----------|----------------------------------|
-| `process-monitor`, `system-monitor`, `go2rtc-monitor` | ~400 ms (built-in file-watcher) |
+| `process-monitor`, `system-monitor`, `go2rtc-monitor`, `filebeat` | ~400 ms (built-in file-watcher) |
 | `monitor` (enabled / disabled flags) | 5 s (periodic disk poll) |
 
 No restart required for any component.
@@ -271,7 +277,8 @@ All binaries read the same file.
   "monitors": {
     "process_monitor": { ... },
     "system_monitor":  { ... },
-    "go2rtc_monitor":  { ... }
+    "go2rtc_monitor":  { ... },
+    "filebeat":        { ... }
   }
 }
 ```
@@ -410,6 +417,73 @@ Full example with custom URL and logging options:
 
 ---
 
+### `monitors.filebeat`
+
+Tails external log files (produced by other applications) and forwards every new
+line into the monitor log folder as a structured NDJSON event.  Disabled by default.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `enabled` | `false` | Set `true` to activate |
+| `poll_interval_ms` | 5000 | How often to scan for new content in source files |
+| `min_tick_ms` | 500 | Sleep granularity — see `process_monitor.min_tick_ms` |
+| `sources` | `[]` | List of source entries (see below) |
+
+Each entry in `sources`:
+
+| Key | Description |
+|-----|-------------|
+| `name` | Logical name — used as the output file base name (`<name>.0.jsonl`) |
+| `folder` | Directory to scan. Windows environment variables are expanded (e.g. `%ProgramData%`) |
+| `pattern` | Glob pattern for files within `folder`, e.g. `*.log`, `app-*.txt` |
+
+**Log files produced:** `filebeat.jsonl` (filebeat's own activity log) plus one
+`<name>.N.jsonl` per source entry.
+
+**Read-offset persistence:** byte offsets for every tracked file are stored in
+`filebeat_state.json` in the log directory.  This prevents already-forwarded
+lines from being re-sent after a restart.  The state file also tracks the
+0-based line index and a hash of the last forwarded line so that filebeat can
+intelligently resume after a file reappearance.
+
+**File rotation / deletion:** if a source file shrinks below the last known
+offset (truncated or replaced), filebeat resets to offset 0 and logs a
+`file_rotated` WARN.  When a tracked file disappears from the glob results a
+`file_missing` WARN is emitted once; repeated polls are silent until the file
+returns.  When the file reappears, filebeat tries to resume cleanly (see
+[filebeat events](#filebeat-events)).
+
+Minimal example:
+
+```json
+"filebeat": {
+  "enabled": true,
+  "sources": [
+    { "name": "myapp", "folder": "%ProgramData%/MyApp/logs", "pattern": "*.log" }
+  ]
+}
+```
+
+Full example:
+
+```json
+"filebeat": {
+  "enabled": true,
+  "poll_interval_ms": 5000,
+  "min_tick_ms": 500,
+  "sources": [
+    { "name": "go2rtc_app",   "folder": "C:/apps/go2rtc/logs",  "pattern": "*.log" },
+    { "name": "ffmpeg_output", "folder": "%ProgramData%/ffmpeg", "pattern": "ffmpeg-*.txt" },
+    { "name": "adobe_logs",   "folder": "%ProgramData%/Adobe",   "pattern": "*.log" }
+  ]
+}
+```
+
+This produces `go2rtc_app.0.jsonl`, `ffmpeg_output.0.jsonl`, and
+`adobe_logs.0.jsonl` in the monitor log folder alongside `filebeat.jsonl`.
+
+---
+
 ## Log file naming
 
 Each monitor uses numbered rotation independently:
@@ -426,6 +500,9 @@ sys_resources.0.jsonl
 sys_resources.1.jsonl      ← active
 
 go2rtc_streams.0.jsonl     ← active
+
+filebeat.0.jsonl           ← filebeat activity log (active)
+myapp.0.jsonl              ← forwarded lines from the "myapp" source
 ```
 
 Every file starts with a `monitor_start` entry.  Rotation entries include
@@ -705,6 +782,64 @@ Get-Content C:\monitor\sys_resources.*.jsonl |
 
 ---
 
+### filebeat events
+
+Filebeat writes two kinds of log files:
+
+- **`filebeat.jsonl`** — filebeat's own activity (starts, stops, errors, and per-file status changes)
+- **`<source_name>.N.jsonl`** — one file per configured source, containing the forwarded lines
+
+#### `log_line`
+Written to the per-source log file for every forwarded line.
+```json
+{ "source_name": "myapp", "source_file": "app.log", "line": "<raw original content>" }
+```
+
+#### `lines_forwarded`
+Written to `filebeat.jsonl` after each poll that forwarded at least one line.
+```json
+{ "source_name": "myapp", "source_file": "app.log", "lines_forwarded": 14 }
+```
+
+#### `file_rotated`
+Written to `filebeat.jsonl` at WARN level when a source file shrinks below the last known
+offset (file was truncated or replaced).  Reading restarts from byte 0.
+```json
+{ "source_name": "myapp", "source_file": "app.log", "previous_offset": 204800, "last_line_index": 1023 }
+```
+
+#### `file_missing`
+Written to `filebeat.jsonl` at WARN level the first time a previously-tracked file is
+absent from the glob results.  Not repeated on subsequent polls until the file returns.
+```json
+{ "msg": "source file missing: app.log", "detail": "myapp" }
+```
+
+#### File-reappearance events
+When a missing file shows up again, filebeat emits one of the following events and
+resumes reading at the appropriate offset.
+
+| Event | Level | Condition | Resume behaviour |
+|-------|-------|-----------|-----------------|
+| `file_appeared_same_state` | INFO | File size == last known offset | Continue reading from the same position — no data gap |
+| `file_appeared_empty` | WARN | File exists but is empty | Reset to offset 0; read new content as it arrives |
+| `file_appeared_resumed` | INFO | Last forwarded line hash found in the file | Resume immediately after that line — no duplicates, no gaps |
+| `file_appeared_no_match` | WARN | Last line hash not found (unrelated replacement) | Reset to offset 0 and read from the beginning |
+
+All four events share the same fields:
+```json
+{ "source_name": "myapp", "source_file": "app.log", "last_line_index": 1023, "resumed_at_offset": 204712 }
+```
+
+#### `source_error`
+Written to `filebeat.jsonl` at ERROR level when a glob pattern is invalid or a
+`LogWriter` cannot be created for a source.
+```json
+{ "msg": "invalid glob 'C:/bad[path/*.log': ...", "detail": "myapp" }
+```
+
+---
+
 ## Grep examples
 
 ```powershell
@@ -764,4 +899,21 @@ Get-Content C:\monitor\go2rtc_streams.*.jsonl |
 Get-Content C:\monitor\sys_resources.*.jsonl |
   ConvertFrom-Json | Where-Object event -eq network_drop_alert |
   Select-Object ts, msg
+
+# All lines forwarded from a specific filebeat source
+Get-Content C:\monitor\myapp.*.jsonl |
+  ConvertFrom-Json | Where-Object event -eq log_line |
+  Select-Object ts, source_file, line
+
+# File rotation and missing-file events across all filebeat sources
+Get-Content C:\monitor\filebeat.*.jsonl |
+  ConvertFrom-Json |
+  Where-Object { $_.event -in @("file_rotated", "file_missing", "file_appeared_same_state",
+                                  "file_appeared_empty", "file_appeared_resumed", "file_appeared_no_match") } |
+  Select-Object ts, event, msg, detail
+
+# How many lines were forwarded per source in the last poll cycle
+Get-Content C:\monitor\filebeat.*.jsonl |
+  ConvertFrom-Json | Where-Object event -eq lines_forwarded |
+  Select-Object -Last 20 | Select-Object ts, source_name, source_file, lines_forwarded
 ```

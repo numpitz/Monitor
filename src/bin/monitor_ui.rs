@@ -11,7 +11,7 @@
 
 use eframe::egui;
 use egui_plot;
-use process_monitor::config::Config;
+use process_monitor::config::{Config, FilebeatSourceConfig};
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
@@ -121,23 +121,27 @@ struct StreamRow {
     ts:              String,
 }
 
+
 // ── Timeline ──────────────────────────────────────────────────────────────────
 
 const N_BUCKETS: usize = 60;
 
 #[derive(Clone, Default)]
 struct TimelineBucket {
-    ts_start:     f64,   // unix seconds
-    ts_end:       f64,
-    proc_count:   usize,
-    sys_count:    usize,
-    go2rtc_count: usize,
-    warn_count:   usize,
-    error_count:  usize,
+    ts_start:      f64,   // unix seconds
+    ts_end:        f64,
+    proc_count:    usize,
+    sys_count:     usize,
+    go2rtc_count:  usize,
+    filebeat_count: usize,
+    warn_count:    usize,
+    error_count:   usize,
 }
 
 impl TimelineBucket {
-    fn total(&self) -> usize { self.proc_count + self.sys_count + self.go2rtc_count }
+    fn total(&self) -> usize {
+        self.proc_count + self.sys_count + self.go2rtc_count + self.filebeat_count
+    }
 }
 
 #[derive(Clone)]
@@ -186,10 +190,17 @@ struct MonitorApp {
     go2rtc_poll_secs:    u32,
     go2rtc_min_tick_ms:  u32,
 
+    // ── filebeat config ───────────────────────────────────────────────────────
+    filebeat_enabled:      bool,
+    filebeat_poll_secs:    u32,
+    filebeat_min_tick_ms:  u32,
+    filebeat_sources:      Vec<FilebeatSourceConfig>,
+
     // ── go2rtc stream viewer ──────────────────────────────────────────────────
     go2rtc_stream_rows:   Vec<StreamRow>,
     go2rtc_last_refresh:  Option<Instant>,
     go2rtc_source_file:   String,
+
 
     /// How often the UI re-reads the log files (seconds). 0 = manual only.
     ui_refresh_secs: u32,
@@ -225,9 +236,11 @@ impl MonitorApp {
                 let proc_min_tick_ms   = cfg.monitors.process_monitor.min_tick_ms as u32;
                 let sys_poll_secs      = (cfg.monitors.system_monitor.poll_interval_ms            / 1_000) as u32;
                 let sys_min_tick_ms    = cfg.monitors.system_monitor.min_tick_ms as u32;
-                let go2rtc_poll_secs   = (cfg.monitors.go2rtc_monitor.poll_interval_ms / 1_000) as u32;
-                let go2rtc_min_tick_ms = cfg.monitors.go2rtc_monitor.min_tick_ms as u32;
-                let ui_refresh_secs    = cfg.ui.refresh_secs;
+                let go2rtc_poll_secs    = (cfg.monitors.go2rtc_monitor.poll_interval_ms / 1_000) as u32;
+                let go2rtc_min_tick_ms  = cfg.monitors.go2rtc_monitor.min_tick_ms as u32;
+                let filebeat_poll_secs  = (cfg.monitors.filebeat.poll_interval_ms / 1_000) as u32;
+                let filebeat_min_tick_ms = cfg.monitors.filebeat.min_tick_ms as u32;
+                let ui_refresh_secs     = cfg.ui.refresh_secs;
                 Self {
                     log_dir,
                     proc_enabled: cfg.monitors.process_monitor.enabled,
@@ -236,6 +249,10 @@ impl MonitorApp {
                     go2rtc_api_url:    cfg.monitors.go2rtc_monitor.api_url.clone(),
                     go2rtc_poll_secs,
                     go2rtc_min_tick_ms,
+                    filebeat_enabled:      cfg.monitors.filebeat.enabled,
+                    filebeat_poll_secs,
+                    filebeat_min_tick_ms,
+                    filebeat_sources:      cfg.monitors.filebeat.sources.clone(),
                     config: Ok(cfg),
                     proc_poll_secs,
                     proc_snapshot_secs,
@@ -274,6 +291,10 @@ impl MonitorApp {
                 go2rtc_api_url:     "http://localhost:1984".into(),
                 go2rtc_poll_secs:   10,
                 go2rtc_min_tick_ms: 500,
+                filebeat_enabled:      false,
+                filebeat_poll_secs:    5,
+                filebeat_min_tick_ms:  500,
+                filebeat_sources:      Vec::new(),
                 proc_poll_secs:     5,
                 proc_snapshot_secs: 60,
                 proc_min_tick_ms:   500,
@@ -325,6 +346,10 @@ impl MonitorApp {
         cfg.monitors.go2rtc_monitor.api_url                    = self.go2rtc_api_url.clone();
         cfg.monitors.go2rtc_monitor.poll_interval_ms           = self.go2rtc_poll_secs   as u64 * 1_000;
         cfg.monitors.go2rtc_monitor.min_tick_ms                = self.go2rtc_min_tick_ms as u64;
+        cfg.monitors.filebeat.enabled                          = self.filebeat_enabled;
+        cfg.monitors.filebeat.poll_interval_ms                 = self.filebeat_poll_secs  as u64 * 1_000;
+        cfg.monitors.filebeat.min_tick_ms                      = self.filebeat_min_tick_ms as u64;
+        cfg.monitors.filebeat.sources                          = self.filebeat_sources.clone();
         cfg.ui.refresh_secs                                    = self.ui_refresh_secs;
 
         let json = match serde_json::to_string_pretty(&cfg) {
@@ -378,8 +403,8 @@ impl MonitorApp {
             Err(_)  => "go2rtc_streams.jsonl".to_string(),
         };
 
-        let mut timestamps: Vec<(f64, usize)> = Vec::new(); // (unix_secs, source 0/1/2)
-        for (src, base) in [&proc_base, &sys_base, &go2rtc_base].iter().enumerate() {
+        let mut timestamps: Vec<(f64, usize)> = Vec::new(); // (unix_secs, source 0/1/2/3)
+        for (src, base) in [&proc_base, &sys_base, &go2rtc_base, &"filebeat.jsonl".to_string()].iter().enumerate() {
             for path in find_all_logs(&self.log_dir, base) {
                 if let Ok(content) = std::fs::read_to_string(&path) {
                     for line in content.lines() {
@@ -410,7 +435,7 @@ impl MonitorApp {
         drop(timestamps); // free memory before re-scan
 
         let mut entries: Vec<(f64, usize, u8)> = Vec::new(); // (ts, src, level)
-        for (src, base) in [&proc_base, &sys_base, &go2rtc_base].iter().enumerate() {
+        for (src, base) in [&proc_base, &sys_base, &go2rtc_base, &"filebeat.jsonl".to_string()].iter().enumerate() {
             for path in find_all_logs(&self.log_dir, base) {
                 if let Ok(content) = std::fs::read_to_string(&path) {
                     for line in content.lines() {
@@ -432,9 +457,10 @@ impl MonitorApp {
         for (ts, src, lvl) in &entries {
             let idx = (((ts - t_start) / bucket_dur) as usize).min(N_BUCKETS - 1);
             match src {
-                0 => buckets[idx].proc_count   += 1,
-                1 => buckets[idx].sys_count    += 1,
-                2 => buckets[idx].go2rtc_count += 1,
+                0 => buckets[idx].proc_count    += 1,
+                1 => buckets[idx].sys_count     += 1,
+                2 => buckets[idx].go2rtc_count  += 1,
+                3 => buckets[idx].filebeat_count += 1,
                 _ => {}
             }
             match lvl {
@@ -794,6 +820,7 @@ impl MonitorApp {
             find_all_logs(&self.log_dir, "proc_resources.jsonl"),
             find_all_logs(&self.log_dir, "sys_resources.jsonl"),
             find_all_logs(&self.log_dir, "go2rtc_streams.jsonl"),
+            find_all_logs(&self.log_dir, "filebeat.jsonl"),
         ];
         let mut lines = Vec::new();
         for paths in &sources {
@@ -1643,6 +1670,7 @@ impl eframe::App for MonitorApp {
                                         });
                                 });
                         }
+
                         }); // runtime_scroll
                     } // Tab::Runtime
 
@@ -1765,6 +1793,95 @@ impl eframe::App for MonitorApp {
                                     if self.go2rtc_min_tick_ms != before { self.dirty = true; self.status.clear(); }
                                     ui.end_row();
                                 });
+                            });
+                        });
+
+                        ui.add_space(8.0);
+
+                        // ── Filebeat ───────────────────────────────────────────
+                        ui.group(|ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                let before = self.filebeat_enabled;
+                                ui.checkbox(&mut self.filebeat_enabled, egui::RichText::new("Filebeat").strong());
+                                if self.filebeat_enabled != before { self.dirty = true; self.status.clear(); }
+                                if !self.filebeat_enabled {
+                                    ui.colored_label(egui::Color32::YELLOW, "  disabled");
+                                }
+                            });
+                            ui.separator();
+                            ui.add_enabled_ui(self.filebeat_enabled, |ui| {
+                                egui::Grid::new("filebeat_grid").num_columns(3).spacing([12.0, 8.0]).show(ui, |ui| {
+                                    ui.label("Poll interval");
+                                    let before = self.filebeat_poll_secs;
+                                    ui.add(egui::Slider::new(&mut self.filebeat_poll_secs, 1..=300).suffix(" s").clamping(egui::SliderClamping::Always));
+                                    ui.label(interval_hint(self.filebeat_poll_secs));
+                                    if self.filebeat_poll_secs != before { self.dirty = true; self.status.clear(); }
+                                    ui.end_row();
+
+                                    ui.label("Response interval");
+                                    let before = self.filebeat_min_tick_ms;
+                                    ui.add(egui::Slider::new(&mut self.filebeat_min_tick_ms, 50..=5000).suffix(" ms").clamping(egui::SliderClamping::Always));
+                                    ui.label(egui::RichText::new("Ctrl-C / config reaction time").color(egui::Color32::GRAY).small());
+                                    if self.filebeat_min_tick_ms != before { self.dirty = true; self.status.clear(); }
+                                    ui.end_row();
+                                });
+
+                                ui.add_space(4.0);
+                                ui.label(egui::RichText::new("Sources").strong());
+                                ui.separator();
+
+                                // Column headers
+                                egui::Grid::new("filebeat_sources_header")
+                                    .num_columns(4)
+                                    .min_col_width(80.0)
+                                    .spacing([8.0, 4.0])
+                                    .show(ui, |ui| {
+                                        ui.label(egui::RichText::new("Name").color(egui::Color32::GRAY).small());
+                                        ui.label(egui::RichText::new("Folder").color(egui::Color32::GRAY).small());
+                                        ui.label(egui::RichText::new("Pattern").color(egui::Color32::GRAY).small());
+                                        ui.label("");
+                                        ui.end_row();
+                                    });
+
+                                let mut to_remove: Option<usize> = None;
+                                egui::Grid::new("filebeat_sources_grid")
+                                    .num_columns(4)
+                                    .min_col_width(80.0)
+                                    .spacing([8.0, 4.0])
+                                    .show(ui, |ui| {
+                                        for (i, src) in self.filebeat_sources.iter_mut().enumerate() {
+                                            if ui.add(egui::TextEdit::singleline(&mut src.name)
+                                                .desired_width(120.0).hint_text("name")).changed() {
+                                                self.dirty = true; self.status.clear();
+                                            }
+                                            if ui.add(egui::TextEdit::singleline(&mut src.folder)
+                                                .desired_width(f32::INFINITY).hint_text("%ProgramData%/MyApp/logs")).changed() {
+                                                self.dirty = true; self.status.clear();
+                                            }
+                                            if ui.add(egui::TextEdit::singleline(&mut src.pattern)
+                                                .desired_width(90.0).hint_text("*.log")).changed() {
+                                                self.dirty = true; self.status.clear();
+                                            }
+                                            if ui.small_button("X").clicked() {
+                                                to_remove = Some(i);
+                                                self.dirty = true; self.status.clear();
+                                            }
+                                            ui.end_row();
+                                        }
+                                    });
+                                if let Some(i) = to_remove {
+                                    self.filebeat_sources.remove(i);
+                                }
+
+                                if ui.button("+ Add source").clicked() {
+                                    self.filebeat_sources.push(FilebeatSourceConfig {
+                                        name:    String::new(),
+                                        folder:  String::new(),
+                                        pattern: "*.log".into(),
+                                    });
+                                    self.dirty = true; self.status.clear();
+                                }
                             });
                         });
 
@@ -2109,6 +2226,22 @@ fn format_log_event(v: &serde_json::Value, event: &str) -> String {
             let pid     = v.get("pid").and_then(|x| x.as_u64()).unwrap_or(0);
             let restart = v.get("restart_count").and_then(|x| x.as_u64()).unwrap_or(0);
             format!("Child started  {name}  pid={pid}  restart #{restart}")
+        }
+        "lines_forwarded" => {
+            let n    = v.get("lines_forwarded").and_then(|x| x.as_u64()).unwrap_or(0);
+            let src  = val_str(v, "source_name");
+            let file = val_str(v, "source_file");
+            format!("Forwarded {n} line(s)  source={src}  file={file}")
+        }
+        "file_rotated" => {
+            let src  = val_str(v, "source_name");
+            let file = val_str(v, "source_file");
+            let off  = v.get("previous_offset").and_then(|x| x.as_u64()).unwrap_or(0);
+            format!("File rotated  source={src}  file={file}  was at byte {off}")
+        }
+        "source_error" => {
+            let msg = val_str(v, "msg");
+            format!("Source error  {msg}")
         }
         "stream_sample" => {
             let empty = vec![];
