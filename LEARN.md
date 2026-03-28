@@ -180,6 +180,61 @@ See [src/bin/filebeat.rs](src/bin/filebeat.rs) `expand_env_vars`.
 
 ---
 
+### Stage 9 — Creating Zip Archives (the `zip` crate)
+
+`src/bin/monitor_ui.rs` `export_logs_zip` is a clean, self-contained example of
+writing a compressed archive from in-memory bytes — useful any time you need to
+bundle files for export or transfer.
+
+**The pattern:**
+
+```rust
+use std::io::Write as _;                     // bring write_all into scope
+
+let file    = std::fs::File::create(&zip_path)?;
+let mut zip = zip::ZipWriter::new(file);     // wraps a Write + Seek impl
+
+let options = zip::write::SimpleFileOptions::default()
+    .compression_method(zip::CompressionMethod::Deflated);
+
+zip.start_file("my_file.txt", options)?;     // declare an entry
+zip.write_all(b"hello")?;                    // write its bytes
+
+zip.start_file("data.jsonl", options)?;      // another entry
+zip.write_all(&std::fs::read("data.jsonl")?)?;
+
+zip.finish()?;                               // flush and close the central directory
+```
+
+**Key types:**
+
+| Type | Role |
+|------|------|
+| `zip::ZipWriter<W>` | Stateful writer — owns the output file handle |
+| `zip::write::SimpleFileOptions` | Per-entry options: compression method, Unix permissions, etc. |
+| `zip::CompressionMethod::Deflated` | Standard zlib deflate — good ratio, widely supported |
+| `zip::CompressionMethod::Stored` | No compression — fastest, no CPU overhead |
+
+**Why `use std::io::Write as _`?**
+
+`ZipWriter` implements `std::io::Write`, but `write_all` is a method on that trait —
+it is only callable when the trait is in scope. The `as _` import brings the trait
+methods into scope without adding a name that could conflict with other `Write` types.
+
+**Generating a timestamped filename** — combine `chrono::Utc::now()` with `format!`:
+
+```rust
+let name = format!("export_{}.zip", chrono::Utc::now().format("%Y%m%d_%H%M%S"));
+```
+
+`chrono::format::strftime` format codes match the C `strftime` convention
+familiar from C++ and Python's `datetime.strftime`.
+
+See [src/bin/monitor_ui.rs](src/bin/monitor_ui.rs) `export_logs_zip` for the full
+real-world implementation including directory scanning and error propagation.
+
+---
+
 ### Stage 10 — Concurrency
 
 Rust's ownership system makes data races a **compile error**, not a runtime crash.
@@ -443,9 +498,10 @@ source tree, sharing one dependency graph and one compiler invocation.
 7.  src/bin/filebeat.rs        persistent JSON state, HashMap::entry, hashing, env-var expansion
 8.  src/bin/process_monitor.rs threads, Arc/RwLock, channels
 9.  src/bin/system_monitor.rs  large real-world integration of all the above
-10. src/sampler.rs             unsafe, Windows FFI
-11. src/pdh_disk.rs            advanced unsafe, Drop trait
-12. src/pdh_gpu.rs             raw memory allocation, pointer arithmetic
+10. src/bin/monitor_ui.rs      egui desktop GUI, zip export, atomic file writes
+11. src/sampler.rs             unsafe, Windows FFI
+12. src/pdh_disk.rs            advanced unsafe, Drop trait
+13. src/pdh_gpu.rs             raw memory allocation, pointer arithmetic
 ```
 
 Start with [src/config.rs](src/config.rs) — coming from C#/Kotlin it will feel immediately readable.

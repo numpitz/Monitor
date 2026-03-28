@@ -151,6 +151,17 @@ struct Timeline {
     t_end:   f64,
 }
 
+// ── Toast notification ────────────────────────────────────────────────────────
+
+struct ExportToast {
+    message: String,
+    /// Folder to open when the user clicks "Open folder".
+    folder:     PathBuf,
+    /// When the toast auto-dismisses.
+    dismiss_at: Instant,
+    success:    bool,
+}
+
 // ── Tab selection ─────────────────────────────────────────────────────────────
 
 #[derive(PartialEq)]
@@ -225,6 +236,11 @@ struct MonitorApp {
     log_window_open:  bool,
     log_window_title: String,
     log_window_lines: Vec<String>,
+
+    // ── Export ────────────────────────────────────────────────────────────────
+    /// Target directory for zip exports. Empty string = use log_dir.
+    export_folder: String,
+    export_toast:  Option<ExportToast>,
 }
 
 impl MonitorApp {
@@ -241,6 +257,7 @@ impl MonitorApp {
                 let filebeat_poll_secs  = (cfg.monitors.filebeat.poll_interval_ms / 1_000) as u32;
                 let filebeat_min_tick_ms = cfg.monitors.filebeat.min_tick_ms as u32;
                 let ui_refresh_secs     = cfg.ui.refresh_secs;
+                let export_folder       = cfg.ui.export_folder.clone().unwrap_or_default();
                 Self {
                     log_dir,
                     proc_enabled: cfg.monitors.process_monitor.enabled,
@@ -280,6 +297,8 @@ impl MonitorApp {
                     log_window_open:   false,
                     log_window_title:  String::new(),
                     log_window_lines:  Vec::new(),
+                    export_folder,
+                    export_toast:      None,
                 }
             }
             Err(e) => Self {
@@ -321,6 +340,8 @@ impl MonitorApp {
                 log_window_open:   false,
                 log_window_title:  String::new(),
                 log_window_lines:  Vec::new(),
+                export_folder:     String::new(),
+                export_toast:      None,
             },
         };
         app.refresh_processes(None);
@@ -330,7 +351,53 @@ impl MonitorApp {
         app
     }
 
+    /// Pack all `.jsonl` log files and `monitor.config.json` into a timestamped zip archive.
+    fn export_logs_zip(&self) -> Result<PathBuf, String> {
+        use std::io::Write as _;
+        let now      = chrono::Utc::now();
+        let zip_name = format!("monitor_export_{}.zip", now.format("%Y%m%d_%H%M%S"));
+        let out_dir  = if self.export_folder.is_empty() {
+            self.log_dir.clone()
+        } else {
+            PathBuf::from(&self.export_folder)
+        };
+        let zip_path = out_dir.join(&zip_name);
+        let file = std::fs::File::create(&zip_path)
+            .map_err(|e| format!("Cannot create zip: {e}"))?;
+        let mut zip     = zip::ZipWriter::new(file);
+        let     options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        let entries = std::fs::read_dir(&self.log_dir)
+            .map_err(|e| format!("Cannot read log dir: {e}"))?;
+        let mut count = 0usize;
+        for entry in entries.flatten() {
+            let path  = entry.path();
+            if !path.is_file() { continue; }
+            let fname = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            let include = fname.ends_with(".jsonl") || fname == "monitor.config.json";
+            if !include { continue; }
+            let data = std::fs::read(&path)
+                .map_err(|e| format!("Cannot read {fname}: {e}"))?;
+            zip.start_file(&fname, options)
+                .map_err(|e| format!("Zip entry error: {e}"))?;
+            zip.write_all(&data)
+                .map_err(|e| format!("Zip write error: {e}"))?;
+            count += 1;
+        }
+        zip.finish().map_err(|e| format!("Zip finish error: {e}"))?;
+        if count == 0 {
+            let _ = std::fs::remove_file(&zip_path);
+            return Err("No log files found to export.".into());
+        }
+        Ok(zip_path)
+    }
+
     fn save(&mut self) {
+        if let Some(src) = self.filebeat_sources.iter().find(|s| s.name.trim().is_empty()) {
+            let folder = if src.folder.is_empty() { "?" } else { &src.folder };
+            self.status = format!("Cannot save: a filebeat source (folder: {folder}) has no name.");
+            return;
+        }
         let cfg = match &mut self.config {
             Ok(c)  => c,
             Err(_) => return,
@@ -351,6 +418,11 @@ impl MonitorApp {
         cfg.monitors.filebeat.min_tick_ms                      = self.filebeat_min_tick_ms as u64;
         cfg.monitors.filebeat.sources                          = self.filebeat_sources.clone();
         cfg.ui.refresh_secs                                    = self.ui_refresh_secs;
+        cfg.ui.export_folder = if self.export_folder.is_empty() {
+            None
+        } else {
+            Some(self.export_folder.clone())
+        };
 
         let json = match serde_json::to_string_pretty(&cfg) {
             Ok(j)  => j,
@@ -866,6 +938,29 @@ impl eframe::App for MonitorApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(egui::RichText::new(self.log_dir.display().to_string())
                         .small().color(egui::Color32::GRAY));
+                    ui.separator();
+                    if ui.button("📦 Export Logs").clicked() {
+                        let toast = match self.export_logs_zip() {
+                            Ok(path) => {
+                                let folder = path.parent()
+                                    .unwrap_or(&path)
+                                    .to_path_buf();
+                                ExportToast {
+                                    message:    format!("Export saved in\n{}", folder.display()),
+                                    folder,
+                                    dismiss_at: Instant::now() + Duration::from_secs(8),
+                                    success:    true,
+                                }
+                            }
+                            Err(e) => ExportToast {
+                                message:    format!("Export failed:\n{e}"),
+                                folder:     self.log_dir.clone(),
+                                dismiss_at: Instant::now() + Duration::from_secs(8),
+                                success:    false,
+                            },
+                        };
+                        self.export_toast = Some(toast);
+                    }
                 });
             });
             ui.add_space(4.0);
@@ -1851,9 +1946,14 @@ impl eframe::App for MonitorApp {
                                     .spacing([8.0, 4.0])
                                     .show(ui, |ui| {
                                         for (i, src) in self.filebeat_sources.iter_mut().enumerate() {
-                                            if ui.add(egui::TextEdit::singleline(&mut src.name)
-                                                .desired_width(120.0).hint_text("name")).changed() {
-                                                self.dirty = true; self.status.clear();
+                                            let name_resp = ui.add(egui::TextEdit::singleline(&mut src.name)
+                                                .desired_width(120.0).hint_text("name"));
+                                            if name_resp.changed() { self.dirty = true; self.status.clear(); }
+                                            if src.name.trim().is_empty() {
+                                                ui.painter().rect_stroke(
+                                                    name_resp.rect, 2.0,
+                                                    egui::Stroke::new(1.5, egui::Color32::RED),
+                                                );
                                             }
                                             if ui.add(egui::TextEdit::singleline(&mut src.folder)
                                                 .desired_width(f32::INFINITY).hint_text("%ProgramData%/MyApp/logs")).changed() {
@@ -1898,6 +1998,16 @@ impl eframe::App for MonitorApp {
                             if self.ui_refresh_secs != before { self.dirty = true; self.status.clear(); }
                         });
 
+                        // ── Export folder ──────────────────────────────────────
+                        ui.horizontal(|ui| {
+                            ui.label("Export folder");
+                            let before = self.export_folder.clone();
+                            ui.add(egui::TextEdit::singleline(&mut self.export_folder)
+                                .desired_width(320.0)
+                                .hint_text("leave empty to save in the log directory"));
+                            if self.export_folder != before { self.dirty = true; self.status.clear(); }
+                        });
+
                         ui.add_space(12.0);
 
                         // ── Save button ────────────────────────────────────────
@@ -1915,6 +2025,49 @@ impl eframe::App for MonitorApp {
 
             } // match
         }); // CentralPanel
+
+        // ── Export toast ──────────────────────────────────────────────────────
+        if let Some(ref toast) = self.export_toast {
+            if Instant::now() >= toast.dismiss_at {
+                self.export_toast = None;
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(500));
+                let folder  = toast.folder.clone();
+                let success = toast.success;
+                let message = toast.message.clone();
+                let mut dismissed = false;
+                egui::Window::new("export_toast")
+                    .title_bar(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -16.0))
+                    .frame(egui::Frame::window(&ctx.style()).inner_margin(egui::Margin::same(12.0)))
+                    .show(ctx, |ui| {
+                        ui.set_max_width(360.0);
+                        ui.horizontal(|ui| {
+                            let icon  = if success { "✅" } else { "❌" };
+                            let color = if success {
+                                egui::Color32::from_rgb(100, 220, 120)
+                            } else {
+                                egui::Color32::from_rgb(220, 80, 80)
+                            };
+                            ui.colored_label(color, icon);
+                            ui.label(egui::RichText::new(&message).strong());
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.small_button("✕").clicked() {
+                                    dismissed = true;
+                                }
+                            });
+                        });
+                        if success {
+                            ui.add_space(4.0);
+                            if ui.button("📂  Open folder").clicked() {
+                                open_in_explorer(&folder);
+                            }
+                        }
+                    });
+                if dismissed { self.export_toast = None; }
+            }
+        }
 
         // ── Log viewer window (opened by double-clicking a heatmap bucket) ────
         if self.log_window_open {
@@ -1941,6 +2094,14 @@ impl eframe::App for MonitorApp {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Open `path` in the OS file manager (Explorer on Windows, xdg-open elsewhere).
+fn open_in_explorer(path: &Path) {
+    #[cfg(target_os = "windows")]
+    { let _ = std::process::Command::new("explorer").arg(path).spawn(); }
+    #[cfg(not(target_os = "windows"))]
+    { let _ = std::process::Command::new("xdg-open").arg(path).spawn(); }
+}
 
 /// Return ALL rotation files for `base_name`, sorted oldest-first (lowest N first).
 fn find_all_logs(log_dir: &Path, base_name: &str) -> Vec<PathBuf> {

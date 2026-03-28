@@ -28,11 +28,16 @@ pub struct UiConfig {
     /// How often monitor-ui re-reads log files (seconds). `0` = manual only.
     #[serde(default = "default_ui_refresh_secs")]
     pub refresh_secs: u32,
+
+    /// Directory where exported zip archives are written.
+    /// `None` (the default) means the log directory itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub export_folder: Option<String>,
 }
 
 impl Default for UiConfig {
     fn default() -> Self {
-        Self { refresh_secs: default_ui_refresh_secs() }
+        Self { refresh_secs: default_ui_refresh_secs(), export_folder: None }
     }
 }
 

@@ -264,6 +264,26 @@ Reads the latest `sys_resources.N.jsonl` and shows the last `system_resource_sam
 
 Progress bars are green / yellow / red based on the default alert thresholds.
 
+### Exporting logs
+
+The **📦 Export Logs** button in the top-right corner of the UI packs all current
+log files and the configuration into a single compressed zip archive.
+
+**What is included:**
+
+| File | Description |
+|------|-------------|
+| `*.jsonl` | All rotated log files for every monitor (`proc_resources`, `sys_resources`, `go2rtc_streams`, `filebeat`, `watchdog`, and any per-source filebeat files) |
+| `monitor.config.json` | The current configuration snapshot |
+
+**Output:** `monitor_export_YYYYMMDD_HHMMSS.zip` written to the log directory by default,
+or to the path configured in `ui.export_folder` (editable via the **Export folder** field
+in the Configuration panel).
+
+After clicking the button the header shows either a green `Saved: monitor_export_….zip`
+confirmation or a red error message.  The zip is ready to attach to a bug report or
+share for analysis without needing to locate individual log files manually.
+
 ---
 
 ## Config (`monitor.config.json`)
@@ -299,6 +319,7 @@ Settings persisted by `monitor-ui`.
 | Key | Default | Description |
 |-----|---------|-------------|
 | `refresh_secs` | 5 | How often the UI re-reads log files (`0` = manual ⟳ only) |
+| `export_folder` | *(omitted)* | Directory where **📦 Export Logs** writes the zip file. Omit or leave empty to write to the log directory |
 
 ---
 
