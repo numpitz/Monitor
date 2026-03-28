@@ -209,6 +209,11 @@ struct MonitorApp {
     plot_selected: HashSet<String>,
     /// PID of the process whose metrics are shown as chart checkboxes.
     selected_proc_pid: Option<u32>,
+
+    // ── Log viewer window ─────────────────────────────────────────────────────
+    log_window_open:  bool,
+    log_window_title: String,
+    log_window_lines: Vec<String>,
 }
 
 impl MonitorApp {
@@ -255,6 +260,9 @@ impl MonitorApp {
                     plot_series:       HashMap::new(),
                     plot_selected:     ["cpu".to_string(), "ram".to_string()].into_iter().collect(),
                     selected_proc_pid: None,
+                    log_window_open:   false,
+                    log_window_title:  String::new(),
+                    log_window_lines:  Vec::new(),
                 }
             }
             Err(e) => Self {
@@ -289,6 +297,9 @@ impl MonitorApp {
                 plot_series:       HashMap::new(),
                 plot_selected:     ["cpu".to_string(), "ram".to_string()].into_iter().collect(),
                 selected_proc_pid: None,
+                log_window_open:   false,
+                log_window_title:  String::new(),
+                log_window_lines:  Vec::new(),
             },
         };
         app.refresh_processes(None);
@@ -777,6 +788,29 @@ impl MonitorApp {
         self.go2rtc_source_file  = paths.last().and_then(|p| p.file_name())
             .unwrap_or_default().to_string_lossy().into_owned();
     }
+
+    fn load_bucket_logs(&self, bucket: &TimelineBucket) -> Vec<String> {
+        let sources = [
+            find_all_logs(&self.log_dir, "proc_resources.jsonl"),
+            find_all_logs(&self.log_dir, "sys_resources.jsonl"),
+            find_all_logs(&self.log_dir, "go2rtc_streams.jsonl"),
+        ];
+        let mut lines = Vec::new();
+        for paths in &sources {
+            for path in paths {
+                let Ok(content) = std::fs::read_to_string(path) else { continue };
+                for line in content.lines() {
+                    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+                    if let Some(ts) = parse_ts_secs(&v) {
+                        if ts >= bucket.ts_start && ts <= bucket.ts_end {
+                            lines.push(line.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        lines
+    }
 }
 
 // ── egui render loop ──────────────────────────────────────────────────────────
@@ -862,12 +896,13 @@ impl eframe::App for MonitorApp {
                             );
 
                             // Extract interaction data before consuming response
-                            let clicked       = response.clicked();
-                            let dragged       = response.dragged();
-                            let interact_pos  = response.interact_pointer_pos();
-                            let hover_pos     = response.hover_pos();
+                            let clicked        = response.clicked();
+                            let double_clicked = response.double_clicked();
+                            let dragged        = response.dragged();
+                            let interact_pos   = response.interact_pointer_pos();
+                            let hover_pos      = response.hover_pos();
 
-                            let hover_text: Option<String> = hover_pos.map(|pos| {
+                            let hover_info: Option<(String, egui::Pos2)> = hover_pos.map(|pos| {
                                 let frac = ((pos.x - rect.left()) / avail_w).clamp(0.0, 1.0);
                                 let idx  = ((frac * n as f32) as usize).min(n - 1);
                                 let b    = &tl.buckets[idx];
@@ -880,15 +915,33 @@ impl eframe::App for MonitorApp {
                                 if b.error_count  > 0 { lines.push(format!("⚠ Errors:  {}", b.error_count)); }
                                 if b.warn_count   > 0 { lines.push(format!("⚠ Warnings: {}", b.warn_count));  }
                                 if b.total()      == 0 { lines.push("No log entries".to_string()); }
-                                lines.join("\n")
+                                (lines.join("\n"), pos)
                             });
-                            if let Some(text) = hover_text { response.on_hover_text(text); }
+                            if let Some((text, _pos)) = hover_info {
+                                egui::show_tooltip_at_pointer(
+                                    ui.ctx(),
+                                    ui.layer_id(),
+                                    egui::Id::new("heatmap_tooltip"),
+                                    |ui| { ui.label(text); },
+                                );
+                            }
 
                             if clicked || dragged {
                                 if let Some(pos) = interact_pos {
                                     let frac = ((pos.x - rect.left()) / avail_w).clamp(0.0, 1.0);
                                     let idx  = ((frac * n as f32) as usize).min(n - 1);
                                     if idx != self.timeline_idx { new_timeline_idx = Some(idx); }
+                                }
+                            }
+
+                            if double_clicked {
+                                if let Some(pos) = interact_pos {
+                                    let frac = ((pos.x - rect.left()) / avail_w).clamp(0.0, 1.0);
+                                    let idx  = ((frac * n as f32) as usize).min(n - 1);
+                                    let b    = &tl.buckets[idx];
+                                    self.log_window_title = format!("Logs  {} – {}", fmt_bucket_time(b.ts_start), fmt_bucket_time(b.ts_end));
+                                    self.log_window_lines = self.load_bucket_logs(b);
+                                    self.log_window_open  = true;
                                 }
                             }
 
@@ -1745,6 +1798,28 @@ impl eframe::App for MonitorApp {
 
             } // match
         }); // CentralPanel
+
+        // ── Log viewer window (opened by double-clicking a heatmap bucket) ────
+        if self.log_window_open {
+            let title = self.log_window_title.clone();
+            egui::Window::new(&title)
+                .open(&mut self.log_window_open)
+                .resizable(true)
+                .default_size([720.0, 500.0])
+                .show(ctx, |ui| {
+                    if self.log_window_lines.is_empty() {
+                        ui.label("No log entries in this bucket.");
+                    } else {
+                        ui.label(format!("{} entries", self.log_window_lines.len()));
+                        ui.separator();
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            for line in &self.log_window_lines {
+                                render_log_entry(ui, line);
+                            }
+                        });
+                    }
+                });
+        }
     }
 }
 
@@ -1925,6 +2000,143 @@ fn val_u32(v: &serde_json::Value, key: &str) -> u32 {
 
 fn val_str(v: &serde_json::Value, key: &str) -> String {
     v.get(key).and_then(|x| x.as_str()).unwrap_or("").to_string()
+}
+
+/// Render a single JSONL log line in the log viewer window, formatted for readability.
+/// Click the collapse arrow to expand and see the raw pretty-printed JSON.
+fn render_log_entry(ui: &mut egui::Ui, line: &str) {
+    let v: serde_json::Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(_) => { ui.monospace(line); return; }
+    };
+    let time    = ts_time(&v);
+    let event   = v.get("event").and_then(|x| x.as_str()).unwrap_or("?");
+    let level   = v.get("level").and_then(|x| x.as_str()).unwrap_or("INFO");
+    let summary = format_log_event(&v, event);
+    let header  = format!("{time}  [{level}]  {summary}");
+    egui::CollapsingHeader::new(
+            egui::RichText::new(&header).small()
+                .color(match level {
+                    "WARN"  => egui::Color32::from_rgb(212, 172, 13),
+                    "ERROR" => egui::Color32::from_rgb(192,  57, 43),
+                    _       => egui::Color32::LIGHT_GRAY,
+                })
+        )
+        .id_salt(line)
+        .default_open(false)
+        .show(ui, |ui| {
+            let pretty = serde_json::to_string_pretty(&v).unwrap_or_else(|_| line.to_string());
+            ui.monospace(&pretty);
+        });
+}
+
+fn format_log_event(v: &serde_json::Value, event: &str) -> String {
+    match event {
+        "monitor_start" => {
+            let pid  = v.get("pid").and_then(|x| x.as_u64()).unwrap_or(0);
+            let file = val_str(v, "log_file");
+            format!("Monitor started  pid={pid}  file={file}")
+        }
+        "process_tree_snapshot" => {
+            let count = v.get("count").and_then(|x| x.as_u64()).unwrap_or(0);
+            let names: Vec<&str> = v.get("processes")
+                .and_then(|a| a.as_array())
+                .map(|arr| arr.iter()
+                    .filter_map(|p| p.get("name").and_then(|n| n.as_str()))
+                    .take(4).collect())
+                .unwrap_or_default();
+            if names.is_empty() {
+                format!("Snapshot  {count} processes")
+            } else {
+                format!("Snapshot  {count} processes  {}", names.join("  "))
+            }
+        }
+        "process_spawned" => {
+            let name = val_str(v, "name");
+            let pid  = v.get("pid").and_then(|x| x.as_u64()).unwrap_or(0);
+            format!("Process spawned  {name}  pid={pid}")
+        }
+        "process_exited" => {
+            let name = val_str(v, "name");
+            let pid  = v.get("pid").and_then(|x| x.as_u64()).unwrap_or(0);
+            format!("Process exited  {name}  pid={pid}")
+        }
+        "resource_sample" => {
+            let procs = v.get("processes").and_then(|a| a.as_array());
+            let count = procs.map(|a| a.len()).unwrap_or(0);
+            let empty = vec![];
+            let arr   = procs.unwrap_or(&empty);
+            let mut top: Vec<(f64, &str)> = arr.iter()
+                .filter_map(|p| {
+                    let cpu  = p.get("cpu_percent").and_then(|x| x.as_f64())?;
+                    let name = p.get("name").and_then(|x| x.as_str())?;
+                    Some((cpu, name))
+                }).collect();
+            top.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            let top_str: Vec<String> = top.iter().take(3)
+                .map(|(cpu, name)| format!("{name} {cpu:.1}%")).collect();
+            if top_str.is_empty() {
+                format!("CPU/RAM sample  {count} processes")
+            } else {
+                format!("CPU/RAM sample  {count} processes  top: {}", top_str.join("  "))
+            }
+        }
+        "io_sample" => {
+            let count = v.get("processes").and_then(|a| a.as_array()).map(|a| a.len()).unwrap_or(0);
+            format!("I/O sample  {count} processes")
+        }
+        "system_info" => {
+            let cpu   = val_str(v, "cpu_brand");
+            let cores = v.get("cpu_core_count").and_then(|x| x.as_u64()).unwrap_or(0);
+            let mem   = v.get("memory_total_mb").and_then(|x| x.as_f64()).unwrap_or(0.0);
+            let os    = val_str(v, "os_name");
+            let ver   = val_str(v, "os_version");
+            format!("System  {cpu}  {cores} cores  {:.0} GB RAM  {os} {ver}", mem / 1024.0)
+        }
+        "system_resource_sample" => {
+            let cpu      = v.get("cpu_used_percent").and_then(|x| x.as_f64()).unwrap_or(0.0);
+            let mem_used = v.get("memory_used_mb").and_then(|x| x.as_f64()).unwrap_or(0.0);
+            let mem_tot  = v.get("memory_total_mb").and_then(|x| x.as_f64()).unwrap_or(0.0);
+            let mem_pct  = if mem_tot > 0.0 { mem_used / mem_tot * 100.0 } else { 0.0 };
+            let swap     = v.get("swap_used_mb").and_then(|x| x.as_f64()).unwrap_or(0.0);
+            format!(
+                "CPU {cpu:.1}%  RAM {:.1}/{:.1} GB ({mem_pct:.0}%)  Swap {:.1} GB",
+                mem_used / 1024.0, mem_tot / 1024.0, swap / 1024.0
+            )
+        }
+        "child_started" => {
+            let name    = val_str(v, "name");
+            let pid     = v.get("pid").and_then(|x| x.as_u64()).unwrap_or(0);
+            let restart = v.get("restart_count").and_then(|x| x.as_u64()).unwrap_or(0);
+            format!("Child started  {name}  pid={pid}  restart #{restart}")
+        }
+        "stream_sample" => {
+            let empty = vec![];
+            let streams = v.get("streams").and_then(|a| a.as_array()).unwrap_or(&empty);
+            let parts: Vec<String> = streams.iter().map(|s| {
+                let name   = s.get("name").and_then(|x| x.as_str()).unwrap_or("?");
+                let active = s.get("producer_active").and_then(|x| x.as_bool()).unwrap_or(false);
+                let cons   = s.get("consumer_count").and_then(|x| x.as_u64()).unwrap_or(0);
+                if active { format!("{name} ✓ {cons}") } else { format!("{name} ✗") }
+            }).collect();
+            if parts.is_empty() { "Streams  (none)".into() }
+            else { format!("Streams  {}", parts.join("  ")) }
+        }
+        other => {
+            let kv: Vec<String> = v.as_object()
+                .map(|m| m.iter()
+                    .filter(|(k, val)| {
+                        !["ts","monitor","event","level"].contains(&k.as_str())
+                            && (val.is_number() || val.is_boolean())
+                    })
+                    .take(4)
+                    .map(|(k, val)| format!("{k}={val}"))
+                    .collect())
+                .unwrap_or_default();
+            if kv.is_empty() { other.to_string() }
+            else { format!("{other}  {}", kv.join("  ")) }
+        }
+    }
 }
 
 /// Human-readable hint shown next to the slider value.
