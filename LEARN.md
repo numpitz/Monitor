@@ -196,7 +196,9 @@ name = "system-monitor"            ← produces system-monitor.exe
 - `[lib]` = a `.dll` / `.jar` compiled once and linked into everything else
 - `[[bin]]` = a separate `main()` entry point like a separate `Program.cs` — produces its own `.exe`
 
-All five executables and the library are built from the same source tree with one `cargo build`.
+All executables and the library are built from the same source tree with one `cargo build`.
+On non-Windows platforms, binaries that depend on Windows APIs are excluded automatically via
+`required-features` — see Stage 5 for how this works.
 
 ---
 
@@ -260,13 +262,13 @@ mod sampler;
 
 **Why this split?**
 `discovery.rs` and `sampler.rs` use Windows-specific unsafe code.
-Putting them in the shared lib would force `monitor_ui` (a GUI app) and `monitor_watchdog` (a process supervisor) to compile code they do not need.
+Putting them in the shared lib would force `monitor_ui` (a GUI app) and `monitor` (a process supervisor) to compile code they do not need.
 
 ---
 
 ### Stage 5 — Dependencies and Feature Flags
 
-[Cargo.toml:33-66](Cargo.toml#L33-L66) controls which external crates are compiled in.
+[Cargo.toml:34-74](Cargo.toml#L34-L74) controls which external crates and binaries are compiled in.
 
 **Platform-conditional dependencies:**
 
@@ -275,7 +277,7 @@ Putting them in the shared lib would force `monitor_ui` (a GUI app) and `monitor
 windows = { version = "0.58", features = [...] }
 ```
 
-[Cargo.toml:50-61](Cargo.toml#L50-L61)
+[Cargo.toml:62-74](Cargo.toml#L62-L74)
 
 This crate is only compiled on Windows. On Linux/macOS it does not exist at all.
 This is the Rust equivalent of `#ifdef _WIN32` in C++ but applied at the package level.
@@ -284,12 +286,22 @@ This is the Rust equivalent of `#ifdef _WIN32` in C++ but applied at the package
 
 ```toml
 [features]
-nvidia = ["nvml-wrapper"]
+default         = ["process_monitor", "monitor_ui"]
+process_monitor = []   # Windows-only binary
+monitor_ui      = []   # GUI binary — exclude on headless targets
+nvidia          = ["nvml-wrapper"]
 ```
 
-[Cargo.toml:64-66](Cargo.toml#L64-L66)
+[Cargo.toml:38-43](Cargo.toml#L38-L43)
 
-`nvml-wrapper` is only compiled when you explicitly request it:
+Features serve two roles here:
+
+1. **Gating entire binaries** — `process-monitor` and `monitor-ui` each declare `required-features`
+   ([Cargo.toml:15](Cargo.toml#L15), [Cargo.toml:24](Cargo.toml#L24)).
+   Cargo refuses to build those binaries unless the matching feature is active.
+   On Linux you pass `--no-default-features` and those binaries are simply excluded from the build.
+
+2. **Gating optional dependencies** — `nvml-wrapper` is only compiled when you request it:
 
 ```
 cargo build --release --features nvidia
@@ -297,8 +309,12 @@ cargo build --release --features nvidia
 
 Inside `system_monitor.rs` the code is guarded with `#[cfg(feature = "nvidia")]` at
 [src/bin/system_monitor.rs:57-58](src/bin/system_monitor.rs#L57-L58).
+Inside `monitor.rs` children are gated with `#[cfg(feature = "process_monitor")]` and
+`#[cfg(feature = "monitor_ui")]` at [src/bin/monitor.rs:186-192](src/bin/monitor.rs#L186-L192).
 
-**The analogy:** This is like a C# conditional compilation symbol (`#if NVIDIA`) declared in the project file, not scattered through the code.
+**The analogy:** Features are like C# conditional compilation symbols (`#if NVIDIA`) declared
+in the project file. `required-features` is like a Gradle `compileOnly` dependency — the
+output is simply not produced if the condition isn't met.
 
 ---
 
@@ -344,11 +360,11 @@ Cargo.toml
 ├── src/pdh_gpu.rs                ← same
 │
 └── src/bin/
-    ├── process_monitor.rs        → process-monitor.exe
-    ├── system_monitor.rs         → system-monitor.exe
-    ├── monitor_ui.rs             → monitor-ui.exe
-    ├── go2rtc_monitor.rs         → go2rtc-monitor.exe
-    └── monitor_watchdog.rs       → monitor-watchdog.exe
+    ├── process_monitor.rs        → process-monitor  (feature: process_monitor — Windows only)
+    ├── system_monitor.rs         → system-monitor   (all platforms)
+    ├── monitor_ui.rs             → monitor-ui       (feature: monitor_ui — GUI targets)
+    ├── go2rtc_monitor.rs         → go2rtc-monitor   (all platforms)
+    └── monitor.rs                → monitor          (all platforms)
 ```
 
 **Key rule to internalize:** In Rust there is no "one project per executable".

@@ -1,21 +1,30 @@
-//! monitor-watchdog — starts and supervises all monitor processes.
+//! monitor — starts and supervises all monitor processes.
 //!
 //! # Usage
 //!
-//!   monitor-watchdog.exe <LOG_DIR>             (with console window)
-//!   monitor-watchdog.exe <LOG_DIR> --no-console (run silently)
+//!   monitor <LOG_DIR>             (with console window)
+//!   monitor <LOG_DIR> --no-console (run silently)
 //!
 //! # Behaviour
 //!
 //! * Reads `monitor.config.json` to decide which monitors are enabled.
-//! * Spawns each enabled monitor (`process-monitor`, `system-monitor`,
-//!   `go2rtc-monitor`) from the same directory as this executable.
+//! * Spawns each enabled monitor from the same directory as this executable.
+//!   Which monitors are available depends on the build features:
+//!     - `process_monitor` feature (default, Windows only): process-monitor
+//!     - always: system-monitor, go2rtc-monitor
+//!     - `monitor_ui` feature (default, GUI targets only): monitor-ui
 //! * Checks every 500 ms whether any child has exited. If so, waits
 //!   `RESTART_DELAY` seconds and then restarts it — unless the monitor was
 //!   disabled in the config in the meantime.
-//! * Terminating the watchdog (Ctrl-C / SIGTERM) kills all children first,
+//! * Terminating the monitor (Ctrl-C / SIGTERM) kills all children first,
 //!   then exits cleanly.
 //! * Writes its own NDJSON log to `watchdog.N.jsonl` in `<LOG_DIR>`.
+//!
+//! # Build targets
+//!
+//!   Windows (full):          cargo build
+//!   Linux / ARM (headless):  cargo build --no-default-features
+//!   Linux / ARM (with UI):   cargo build --no-default-features --features monitor_ui
 //!
 //! # Config hot-reload
 //!
@@ -45,14 +54,14 @@ use process_monitor::{
     writer::LogWriter,
 };
 
-const MONITOR:       &str      = "monitor_watchdog";
+const MONITOR:       &str      = "monitor";
 const RESTART_DELAY: Duration  = Duration::from_secs(3);
 const POLL_INTERVAL: Duration  = Duration::from_millis(500);
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
-#[command(name = "monitor-watchdog", about = "Supervisor for the monitor suite — keeps all monitors alive")]
+#[command(name = "monitor", about = "Supervisor for the monitor suite — keeps all monitors alive")]
 struct Args {
     /// Directory that contains monitor.config.json (log files are also written here)
     log_dir: PathBuf,
@@ -98,6 +107,7 @@ impl ManagedChild {
     }
 
     /// A GUI tool: started once, never restarted, never gets `--no-console`.
+    #[cfg_attr(not(feature = "monitor_ui"), allow(dead_code))]
     fn gui(name: &'static str, binary: &'static str) -> Self {
         Self {
             name,
@@ -169,7 +179,7 @@ fn main() -> Result<()> {
     log_writer.write_entry(&start)?;
 
     cprint!(args.no_console,
-        "[monitor-watchdog] started  pid={}  log={}",
+        "[monitor] started  pid={}  log={}",
         monitor_pid, log_writer.current_log_file_name()
     );
 
@@ -182,7 +192,7 @@ fn main() -> Result<()> {
         thread::spawn(move || {
             for line in &rx {
                 if let Err(e) = log_writer.write_line(&line) {
-                    cprint!(no_console, "[watchdog writer] error: {e}");
+                    cprint!(no_console, "[monitor writer] error: {e}");
                 }
             }
             let stop = LogEntry::info(MONITOR, "monitor_stop", MonitorStopData {
@@ -193,7 +203,7 @@ fn main() -> Result<()> {
             if let Ok(line) = serde_json::to_string(&stop) {
                 let _ = log_writer.write_line(&line);
             }
-            cprint!(no_console, "[monitor-watchdog] writer thread exited cleanly");
+            cprint!(no_console, "[monitor] writer thread exited cleanly");
         })
     };
 
@@ -206,10 +216,13 @@ fn main() -> Result<()> {
     }
 
     // ── Managed children (order determines startup order) ─────────────────────
+    // Each child is only included when its feature is active at compile time.
     let mut children = vec![
+        #[cfg(feature = "process_monitor")]
         ManagedChild::monitor("process-monitor", "process-monitor"),
         ManagedChild::monitor("system-monitor",  "system-monitor"),
         ManagedChild::monitor("go2rtc-monitor",  "go2rtc-monitor"),
+        #[cfg(feature = "monitor_ui")]
         ManagedChild::gui    ("monitor-ui",       "monitor-ui"),
     ];
 
@@ -226,13 +239,16 @@ fn main() -> Result<()> {
             last_cfg_check = Instant::now();
         }
 
-        // The UI has no config-driven enabled flag — it is always started.
+        // Build an enabled flag per child, in the same order as `children`.
+        // cfg attributes must mirror those used in the children vec above.
         let monitors_cfg = &current_cfg.monitors;
         let enabled = [
+            #[cfg(feature = "process_monitor")]
             monitors_cfg.process_monitor.enabled,
-            monitors_cfg.system_monitor .enabled,
-            monitors_cfg.go2rtc_monitor .enabled,
-            true, // monitor-ui: always start
+            monitors_cfg.system_monitor.enabled,
+            monitors_cfg.go2rtc_monitor.enabled,
+            #[cfg(feature = "monitor_ui")]
+            true, // monitor-ui: always start when built
         ];
 
         for (mc, &en) in children.iter_mut().zip(enabled.iter()) {
@@ -241,7 +257,7 @@ fn main() -> Result<()> {
             if !en {
                 if mc.is_running() {
                     cprint!(args.no_console,
-                        "[watchdog] {} disabled in config — stopping", mc.name);
+                        "[monitor] {} disabled in config — stopping", mc.name);
                     kill_child(mc, args.no_console);
                 }
                 continue;
@@ -254,7 +270,7 @@ fn main() -> Result<()> {
                     Ok(None)         => None,   // still running
                     Err(e) => {
                         cprint!(args.no_console,
-                            "[watchdog] try_wait error for {}: {e}", mc.name);
+                            "[monitor] try_wait error for {}: {e}", mc.name);
                         None
                     }
                 }
@@ -270,7 +286,7 @@ fn main() -> Result<()> {
                 if mc.restart_on_exit {
                     mc.last_exit_at = Some(Instant::now());
                     cprint!(args.no_console,
-                        "[watchdog] {} exited  code={:?}  uptime={}s  — will restart in {}s",
+                        "[monitor] {} exited  code={:?}  uptime={}s  — will restart in {}s",
                         mc.name, exit_code, uptime, RESTART_DELAY.as_secs());
                     send(&tx, &LogEntry::warn(MONITOR, "child_exited", ChildExitedData {
                         name:           mc.name.to_string(),
@@ -279,7 +295,7 @@ fn main() -> Result<()> {
                     }));
                 } else {
                     cprint!(args.no_console,
-                        "[watchdog] {} closed  code={:?}  uptime={}s  (not restarting)",
+                        "[monitor] {} closed  code={:?}  uptime={}s  (not restarting)",
                         mc.name, exit_code, uptime);
                     send(&tx, &LogEntry::info(MONITOR, "child_exited", ChildExitedData {
                         name:           mc.name.to_string(),
@@ -309,7 +325,7 @@ fn main() -> Result<()> {
 
                             if mc.restart_count == 0 {
                                 cprint!(args.no_console,
-                                    "[watchdog] started {} pid={}", mc.name, pid);
+                                    "[monitor] started {} pid={}", mc.name, pid);
                                 send(&tx, &LogEntry::info(MONITOR, "child_started", ChildStartedData {
                                     name:          mc.name.to_string(),
                                     pid,
@@ -318,7 +334,7 @@ fn main() -> Result<()> {
                             } else {
                                 mc.restart_count += 1;
                                 cprint!(args.no_console,
-                                    "[watchdog] restarted {} pid={}  attempt #{}",
+                                    "[monitor] restarted {} pid={}  attempt #{}",
                                     mc.name, pid, mc.restart_count);
                                 send(&tx, &LogEntry::info(MONITOR, "child_restarted", ChildStartedData {
                                     name:          mc.name.to_string(),
@@ -329,7 +345,7 @@ fn main() -> Result<()> {
                         }
                         Err(e) => {
                             cprint!(args.no_console,
-                                "[watchdog] failed to start {}: {e}", mc.name);
+                                "[monitor] failed to start {}: {e}", mc.name);
                             send(&tx, &LogEntry::error(MONITOR, "child_start_failed", WarningData {
                                 msg:    format!("failed to start {}", mc.name),
                                 detail: Some(e.to_string()),
@@ -350,11 +366,11 @@ fn main() -> Result<()> {
     }
 
     // ── Shutdown: kill all children, then exit ────────────────────────────────
-    cprint!(args.no_console, "[monitor-watchdog] shutting down — stopping children…");
+    cprint!(args.no_console, "[monitor] shutting down — stopping children…");
 
     for mc in &mut children {
         if mc.is_running() {
-            cprint!(args.no_console, "[watchdog] stopping {} pid={}", mc.name,
+            cprint!(args.no_console, "[monitor] stopping {} pid={}", mc.name,
                 mc.pid().unwrap_or(0));
             kill_child(mc, args.no_console);
         }
@@ -363,7 +379,7 @@ fn main() -> Result<()> {
     drop(tx);
     let _ = writer_thread.join();
 
-    cprint!(args.no_console, "[monitor-watchdog] done");
+    cprint!(args.no_console, "[monitor] done");
     Ok(())
 }
 
@@ -401,5 +417,5 @@ fn kill_child(mc: &mut ManagedChild, no_console: bool) {
     }
     mc.started_at   = None;
     mc.last_exit_at = None;
-    cprint!(no_console, "[watchdog] {} stopped", mc.name);
+    cprint!(no_console, "[monitor] {} stopped", mc.name);
 }

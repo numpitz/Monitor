@@ -1,27 +1,29 @@
 # Monitor Suite
 
-Rust 2024 · Windows 10+ · five standalone `.exe` files
+Rust 2024 · Windows / Linux / Linux ARM · cross-platform
 
 A lightweight monitoring suite for video-streaming servers running **go2rtc** and **ffmpeg**.
 All binaries share one `monitor.config.json` and write their own NDJSON log files.
 
-| Binary | Purpose | Log file |
-|--------|---------|----------|
-| `monitor-watchdog.exe` | Supervisor — starts, watches, and restarts all monitors | `watchdog.jsonl` |
-| `process-monitor.exe` | Per-process CPU, RAM, handles, spawn/exit events | `proc_resources.jsonl` |
-| `system-monitor.exe` | System-wide CPU, RAM, swap, disk, network, GPU | `sys_resources.jsonl` |
-| `go2rtc-monitor.exe` | go2rtc stream state — producers, consumers, up/down events | `go2rtc_streams.jsonl` |
-| `monitor-ui.exe` | egui desktop app — live config editor and resource viewer | — |
+| Binary | Purpose | Log file | Platforms |
+|--------|---------|----------|-----------|
+| `monitor` | Supervisor — starts, watches, and restarts all monitors | `watchdog.jsonl` | all |
+| `process-monitor` | Per-process CPU, RAM, handles, spawn/exit events | `proc_resources.jsonl` | Windows only |
+| `system-monitor` | System-wide CPU, RAM, swap, disk, network, GPU | `sys_resources.jsonl` | all |
+| `go2rtc-monitor` | go2rtc stream state — producers, consumers, up/down events | `go2rtc_streams.jsonl` | all |
+| `monitor-ui` | egui desktop app — live config editor and resource viewer | — | GUI targets only |
 
 ---
 
 ## Build
 
+### Windows (full build)
+
 ```powershell
-# Debug (fast compile, for development)
+# Debug
 cargo build
 
-# Release (optimised, stripped — for production)
+# Release (optimised, stripped)
 cargo build --release
 
 # Release with NVIDIA GPU monitoring (requires NVIDIA driver)
@@ -31,14 +33,41 @@ cargo build --release --features nvidia
 Outputs in `target\release\` (or `target\debug\`):
 
 ```
-monitor-watchdog.exe
+monitor.exe
 process-monitor.exe
 system-monitor.exe
 go2rtc-monitor.exe
 monitor-ui.exe
 ```
 
-No runtime dependencies — each ships as a single file.
+### Linux x86_64 / Linux ARM / Raspberry Pi
+
+Components that require Windows APIs are excluded via Cargo feature flags.
+
+| Build command | Binaries produced | Use case |
+|--------------|-------------------|----------|
+| `cargo build --no-default-features` | `monitor`, `system-monitor`, `go2rtc-monitor` | Headless server / Raspberry Pi |
+| `cargo build --no-default-features --features monitor_ui` | + `monitor-ui` | Linux desktop with display |
+
+```bash
+# Headless server or Raspberry Pi
+cargo build --release --no-default-features
+
+# Linux desktop (requires X11/Wayland + libgl1)
+cargo build --release --no-default-features --features monitor_ui
+```
+
+### Platform compatibility
+
+| Binary | Windows x86_64 | Linux x86_64 | Linux ARM / Pi | Notes |
+|--------|:--------------:|:------------:|:--------------:|-------|
+| `monitor` | ✓ | ✓ | ✓ | |
+| `process-monitor` | ✓ | — | — | Uses Win32 APIs; excluded from non-Windows builds |
+| `system-monitor` | ✓ | ✓ | ✓ | GPU and disk I/O metrics are Windows-only; CPU/RAM/network work everywhere |
+| `go2rtc-monitor` | ✓ | ✓ | ✓ | Pure HTTP — no platform-specific code |
+| `monitor-ui` | ✓ | ✓ | ✓ | Requires a display (X11/Wayland); exclude with `--no-default-features` on headless targets |
+
+No runtime dependencies — each binary ships as a single file.
 
 ---
 
@@ -47,42 +76,60 @@ No runtime dependencies — each ships as a single file.
 All binaries take the same first argument: the directory that contains
 `monitor.config.json`.  Log files are also written there.
 
-### Recommended: run everything through the watchdog
+### Recommended: run everything through the supervisor
 
 ```powershell
-# Start all enabled monitors and keep them alive
-monitor-watchdog.exe C:\monitor\
+# Windows — start all enabled monitors and keep them alive
+monitor.exe C:\monitor\
 
-# Same, but detached — no console window
-monitor-watchdog.exe C:\monitor\ --no-console
+# Windows — detached, no console window
+monitor.exe C:\monitor\ --no-console
 ```
 
-The watchdog starts every monitor that is `"enabled": true` in the config,
-**plus `monitor-ui`**, monitors them every 500 ms, and restarts any monitor that
-exits unexpectedly within 3 s.  Ctrl-C (or closing the console window) kills all
-children first, then exits cleanly.
+```bash
+# Linux / ARM
+./monitor /var/monitor/
 
-If a monitor is **disabled** in the config while the watchdog is running, the
-watchdog kills that child and does not restart it.  If a monitor is **enabled**
-in the config while the watchdog is running, the watchdog starts it within 5 s —
-no restart of the watchdog required.
+# Linux / ARM — detached
+./monitor /var/monitor/ --no-console
+```
+
+The supervisor starts every monitor that is `"enabled": true` in the config
+(plus `monitor-ui` when built with the `monitor_ui` feature), polls them every
+500 ms, and restarts any monitor that exits unexpectedly within 3 s.
+Ctrl-C (or SIGTERM) kills all children first, then exits cleanly.
+
+Which monitors are started depends on the build features — only binaries that
+were compiled alongside `monitor` will be launched.
+
+If a monitor is **disabled** in the config while the supervisor is running, the
+supervisor kills that child and does not restart it.  If a monitor is **enabled**
+in the config while the supervisor is running, it starts within 5 s —
+no restart required.
 
 ### Run monitors individually (advanced)
 
 ```powershell
-# With console window
+# Windows — with console window
 process-monitor.exe C:\monitor\
 system-monitor.exe  C:\monitor\
 go2rtc-monitor.exe  C:\monitor\
 
-# Detached, no window
+# Windows — detached, no window
 process-monitor.exe C:\monitor\ --no-console
 system-monitor.exe  C:\monitor\ --no-console
 go2rtc-monitor.exe  C:\monitor\ --no-console
 
-# Configuration UI (started automatically by the watchdog — only needed here
+# Configuration UI (started automatically by the supervisor — only needed here
 # when running monitors individually)
 monitor-ui.exe C:\monitor\
+```
+
+```bash
+# Linux / ARM
+./system-monitor  /var/monitor/
+./go2rtc-monitor  /var/monitor/
+./monitor-ui      /var/monitor/   # only if built with --features monitor_ui
 ```
 
 ### Live configuration
@@ -92,35 +139,36 @@ The UI writes changes atomically.
 | Component | Picks up config changes within… |
 |-----------|----------------------------------|
 | `process-monitor`, `system-monitor`, `go2rtc-monitor` | ~400 ms (built-in file-watcher) |
-| `monitor-watchdog` (enabled / disabled flags) | 5 s (periodic disk poll) |
+| `monitor` (enabled / disabled flags) | 5 s (periodic disk poll) |
 
 No restart required for any component.
 
 ---
 
-## monitor-watchdog
+## monitor
 
-The watchdog is the single entry point for production deployments.
+The supervisor is the single entry point for production deployments.
 
 ### Behaviour summary
 
-| Situation | Watchdog action |
+| Situation | Supervisor action |
 |-----------|-----------------|
 | Monitor enabled in config | Start on next tick (500 ms) |
 | Monitor exits unexpectedly | Log `child_exited`, restart after 3 s |
 | Monitor disabled in config while running | Kill immediately, do not restart |
 | Spawn fails (binary not found, etc.) | Log `child_start_failed`, retry after 3 s |
-| Watchdog receives Ctrl-C | Kill all children, drain log, exit 0 |
+| Supervisor receives Ctrl-C / SIGTERM | Kill all children, drain log, exit 0 |
 | `monitor-ui` window closed by user | Log `child_exited` at INFO, do **not** reopen |
 
-`monitor-ui` is always launched alongside the monitors — no config flag needed.
-It is treated as a one-shot GUI tool: if the user closes the window the watchdog
-leaves it closed.  All other children are restarted automatically.
+`monitor-ui` is launched alongside the monitors when built with the `monitor_ui`
+feature — no config flag needed.  It is treated as a one-shot GUI tool: if the
+user closes the window the supervisor leaves it closed.  All other children are
+restarted automatically.
 
 Config changes are picked up every **5 s** by re-reading `monitor.config.json`
-from disk — no file-watcher thread is used in the watchdog.
+from disk — no file-watcher thread is used in the supervisor.
 
-### Watchdog log events
+### Supervisor log events
 
 | Event | Level | Description |
 |-------|-------|-------------|
@@ -392,7 +440,7 @@ All events share the same envelope:
 ```json
 {
   "ts":      "2026-03-23T10:00:00.000Z",
-  "monitor": "monitor_watchdog | process_monitor | system_monitor | go2rtc_monitor",
+  "monitor": "monitor | process_monitor | system_monitor | go2rtc_monitor",
   "event":   "<event_name>",
   "level":   "INFO | WARN | ERROR",
   "...":     "event-specific fields"
@@ -420,7 +468,7 @@ All events share the same envelope:
 
 ---
 
-### monitor-watchdog events
+### monitor events
 
 #### `child_started`
 Emitted when a monitor is launched for the first time.

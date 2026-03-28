@@ -10,24 +10,36 @@ name = "process_monitor"
 path = "src/lib.rs"
 
 [[bin]]
-name = "process-monitor"
-path = "src/bin/process_monitor.rs"
+name             = "process-monitor"
+path             = "src/bin/process_monitor.rs"
+required-features = ["process_monitor"]
 
 [[bin]]
 name = "system-monitor"
 path = "src/bin/system_monitor.rs"
 
 [[bin]]
-name = "monitor-ui"
-path = "src/bin/monitor_ui.rs"
+name             = "monitor-ui"
+path             = "src/bin/monitor_ui.rs"
+required-features = ["monitor_ui"]
 
 [[bin]]
 name = "go2rtc-monitor"
 path = "src/bin/go2rtc_monitor.rs"
 
 [[bin]]
-name = "monitor-watchdog"
-path = "src/bin/monitor_watchdog.rs"
+name = "monitor"
+path = "src/bin/monitor.rs"
+
+# ── Features ──────────────────────────────────────────────────────────────────
+# Default: full Windows build (all binaries).
+# Linux / ARM headless: cargo build --no-default-features
+# Linux / ARM with UI:  cargo build --no-default-features --features monitor_ui
+[features]
+default         = ["process_monitor", "monitor_ui"]
+process_monitor = []   # Windows-only binary — not built on Linux/ARM
+monitor_ui      = []   # GUI binary — exclude on headless targets
+nvidia          = ["nvml-wrapper"]   # NVIDIA GPU monitoring via NVML (requires NVIDIA driver)
 
 # ── cross-platform deps ───────────────────────────────────────────────────────
 [dependencies]
@@ -60,11 +72,6 @@ windows = { version = "0.58", features = [
     "Win32_System_ProcessStatus",
     "Win32_System_Threading",
 ] }
-
-# ── Features ──────────────────────────────────────────────────────────────────
-[features]
-# Enable to add NVIDIA GPU monitoring via NVML (requires NVIDIA driver).
-nvidia = ["nvml-wrapper"]
 
 # ── release profile: small, stripped binary ───────────────────────────────────
 [profile.release]
