@@ -135,6 +135,23 @@ pub struct IoSampleData {
     pub processes: Vec<IoProcessSample>,
 }
 
+/// One process entry in a port_sample event.
+#[derive(Serialize)]
+pub struct ProcessPortInfo {
+    pub pid:        u32,
+    pub name:       String,
+    /// TCP ports in LISTEN state (sorted, deduplicated, IPv4).
+    pub tcp_listen: Vec<u16>,
+    /// UDP ports bound by this process (sorted, deduplicated, IPv4).
+    pub udp_listen: Vec<u16>,
+}
+
+/// Written every `port_poll_interval_ms` by process-monitor.
+#[derive(Serialize)]
+pub struct PortSampleData {
+    pub processes: Vec<ProcessPortInfo>,
+}
+
 /// Written every `resource_poll_interval_ms`.
 #[derive(Serialize)]
 pub struct ResourceSampleData {

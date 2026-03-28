@@ -25,6 +25,9 @@
 mod discovery;
 #[path = "../sampler.rs"]
 mod sampler;
+#[cfg(windows)]
+#[path = "../net_sampler.rs"]
+mod net_sampler;
 
 use anyhow::Result;
 use clap::Parser;
@@ -173,6 +176,10 @@ fn main() -> Result<()> {
         .checked_sub(Duration::from_millis(pm.io_poll_interval_ms)) // trigger I/O sample on first poll
         .unwrap_or_else(Instant::now);
 
+    let mut last_port_sample = Instant::now()
+        .checked_sub(Duration::from_millis(pm.port_poll_interval_ms)) // trigger port sample on first poll
+        .unwrap_or_else(Instant::now);
+
     cprint!(args.no_console, "[process-monitor] watching {} folder(s):", pm.watch_folders.len());
     for f in &pm.watch_folders {
         cprint!(args.no_console, "  {f}");
@@ -189,6 +196,7 @@ fn main() -> Result<()> {
         let poll_interval     = Duration::from_millis(pm_cfg.resource_poll_interval_ms);
         let snapshot_interval = Duration::from_millis(pm_cfg.snapshot_interval_ms);
         let io_interval       = Duration::from_millis(pm_cfg.io_poll_interval_ms);
+        let port_interval     = Duration::from_millis(pm_cfg.port_poll_interval_ms);
 
         // ── 1. Discover spawns / exits ────────────────────────────────────────
         match discovery.poll() {
@@ -292,6 +300,34 @@ fn main() -> Result<()> {
                 }
             }
             last_io_sample = Instant::now();
+        }
+
+        // ── 3.5. Port sample (listening TCP/UDP ports per process) ───────────
+        #[cfg(windows)]
+        if log_cfg.port_counters
+            && pm_cfg.port_poll_interval_ms > 0
+            && last_port_sample.elapsed() >= port_interval
+        {
+            let known = discovery.known_processes();
+            if !known.is_empty() {
+                let pids: Vec<u32> = known.keys().copied().collect();
+                let entries = net_sampler::sample_listening(&pids);
+                let processes: Vec<ProcessPortInfo> = entries.into_iter()
+                    .filter_map(|e| {
+                        let info = known.get(&e.pid)?;
+                        Some(ProcessPortInfo {
+                            pid:        e.pid,
+                            name:       info.name.clone(),
+                            tcp_listen: e.tcp_listen,
+                            udp_listen: e.udp_listen,
+                        })
+                    })
+                    .collect();
+                if !processes.is_empty() {
+                    send(&tx, &LogEntry::info(MONITOR, "port_sample", PortSampleData { processes }));
+                }
+            }
+            last_port_sample = Instant::now();
         }
 
         // ── 4. Snapshot (skipped when snapshot_interval_ms == 0) ─────────────

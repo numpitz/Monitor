@@ -111,6 +111,12 @@ pub struct ProcessMonitorConfig {
     #[serde(default = "default_io_poll_ms")]
     pub io_poll_interval_ms: u64,
 
+    /// How often to enumerate listening TCP/UDP ports per process (milliseconds).
+    /// Uses a single system-wide GetExtendedTcpTable call — low overhead.
+    /// Set to 0 to disable. Default 30 s.
+    #[serde(default = "default_port_poll_ms")]
+    pub port_poll_interval_ms: u64,
+
     /// Absolute paths. Every .exe found here is watched by name.
     pub watch_folders: Vec<String>,
 
@@ -129,6 +135,7 @@ pub struct ProcessMonitorLogConfig {
     #[serde(default = "yes")] pub process_exit:   bool,
     #[serde(default = "yes")] pub snapshot:       bool,
     #[serde(default = "yes")] pub io_counters:    bool,
+    #[serde(default = "yes")] pub port_counters:  bool,
 
     /// Emit a cpu_alert entry when a process exceeds this threshold.
     #[serde(default)]
@@ -150,6 +157,7 @@ impl Default for ProcessMonitorLogConfig {
             process_exit:                true,
             snapshot:                    true,
             io_counters:                 true,
+            port_counters:               true,
             cpu_alert_threshold_percent: None,
             memory_alert_mb:             None,
         }
@@ -330,6 +338,7 @@ fn default_proc_log_file()    -> String { "proc_resources.jsonl".into() }
 fn default_resource_poll_ms() -> u64    { 5_000 }
 fn default_snapshot_ms()      -> u64    { 60_000 }
 fn default_io_poll_ms()       -> u64    { 10_000 }
+fn default_port_poll_ms()     -> u64    { 30_000 }
 fn default_sys_log_file()     -> String { "sys_resources.jsonl".into() }
 fn default_sys_poll_ms()      -> u64    { 30_000 }
 
